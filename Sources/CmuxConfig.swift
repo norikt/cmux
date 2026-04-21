@@ -14,6 +14,7 @@ struct CmuxCommandDefinition: Codable, Sendable, Identifiable {
     var workspace: CmuxWorkspaceDefinition?
     var command: String?
     var confirm: Bool?
+    var window: CmuxCommandWindow?
 
     var id: String {
         "cmux.config.command." + (name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? name)
@@ -26,7 +27,8 @@ struct CmuxCommandDefinition: Codable, Sendable, Identifiable {
         restart: CmuxRestartBehavior? = nil,
         workspace: CmuxWorkspaceDefinition? = nil,
         command: String? = nil,
-        confirm: Bool? = nil
+        confirm: Bool? = nil,
+        window: CmuxCommandWindow? = nil
     ) {
         self.name = name
         self.description = description
@@ -35,6 +37,7 @@ struct CmuxCommandDefinition: Codable, Sendable, Identifiable {
         self.workspace = workspace
         self.command = command
         self.confirm = confirm
+        self.window = window
     }
 
     init(from decoder: Decoder) throws {
@@ -46,6 +49,7 @@ struct CmuxCommandDefinition: Codable, Sendable, Identifiable {
         workspace = try container.decodeIfPresent(CmuxWorkspaceDefinition.self, forKey: .workspace)
         command = try container.decodeIfPresent(String.self, forKey: .command)
         confirm = try container.decodeIfPresent(Bool.self, forKey: .confirm)
+        window = try container.decodeIfPresent(CmuxCommandWindow.self, forKey: .window)
 
         if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw DecodingError.dataCorrupted(
@@ -79,6 +83,60 @@ struct CmuxCommandDefinition: Codable, Sendable, Identifiable {
                     codingPath: decoder.codingPath,
                     debugDescription: "Command '\(name)' must define either 'workspace' or 'command'"
                 )
+            )
+        }
+
+        if window != nil && command == nil {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Command '\(name)' uses 'window' but has no 'command' to run"
+                )
+            )
+        }
+    }
+}
+
+/// Controls where a command's `command` string runs: inline in the focused
+/// terminal (default) or in a standalone floating `NSPanel` with its own
+/// Ghostty surface (e.g. for `lazygit`).
+struct CmuxCommandWindow: Codable, Sendable {
+    enum Mode: String, Codable, Sendable {
+        case inline
+        case floating
+    }
+
+    var mode: Mode
+    var width: Double?
+    var height: Double?
+    var cwd: String?
+
+    init(mode: Mode, width: Double? = nil, height: Double? = nil, cwd: String? = nil) {
+        self.mode = mode
+        self.width = width
+        self.height = height
+        self.cwd = cwd
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try container.decode(Mode.self, forKey: .mode)
+        width = try container.decodeIfPresent(Double.self, forKey: .width)
+        height = try container.decodeIfPresent(Double.self, forKey: .height)
+        cwd = try container.decodeIfPresent(String.self, forKey: .cwd)
+
+        if let width, width <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .width,
+                in: container,
+                debugDescription: "Window width must be positive"
+            )
+        }
+        if let height, height <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .height,
+                in: container,
+                debugDescription: "Window height must be positive"
             )
         }
     }

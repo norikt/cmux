@@ -1753,6 +1753,13 @@ class GhosttyApp {
 #endif
 
             DispatchQueue.main.async {
+                // Standalone floating TUI windows (lazygit, etc.) own their
+                // surface outside any workspace. Route their runtime close
+                // first so `exit` inside the floating terminal collapses the
+                // NSPanel without needing a workspace lookup.
+                if FloatingTerminalWindowController.handleRuntimeSurfaceClose(surfaceId: callbackSurfaceId) {
+                    return
+                }
                 guard let app = AppDelegate.shared else { return }
                 // Close requests must be resolved by the callback's workspace/surface IDs only.
                 // If the mapping is already gone (duplicate/stale callback), ignore it.

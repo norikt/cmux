@@ -6604,6 +6604,14 @@ struct ContentView: View {
     }
 
     private func commandPaletteShortcutAction(for commandId: String) -> KeyboardShortcutSettings.Action? {
+        if let command = cmuxConfigStore.loadedCommands.first(where: { $0.id == commandId }),
+           command.window?.mode == .floating {
+            let commandName = command.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let shellCommand = command.command?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if commandName == "lazygit" || shellCommand == "lazygit" {
+                return .openLazygitFloating
+            }
+        }
         switch commandId {
         case "palette.newWorkspace":
             return .newTab

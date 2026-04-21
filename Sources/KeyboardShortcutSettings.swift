@@ -63,6 +63,7 @@ enum KeyboardShortcutSettings {
         case closeWorkspace
         case reopenClosedBrowserPanel
         case newSurface
+        case openLazygitFloating
         case toggleTerminalCopyMode
 
         // Panes / splits
@@ -131,6 +132,7 @@ enum KeyboardShortcutSettings {
             case .closeWorkspace: return String(localized: "shortcut.closeWorkspace.label", defaultValue: "Close Workspace")
             case .reopenClosedBrowserPanel: return String(localized: "menu.file.reopenClosedBrowserPanel", defaultValue: "Reopen Closed Browser Panel")
             case .newSurface: return String(localized: "shortcut.newSurface.label", defaultValue: "New Surface")
+            case .openLazygitFloating: return "Lazygit"
             case .toggleTerminalCopyMode: return String(localized: "shortcut.toggleTerminalCopyMode.label", defaultValue: "Toggle Terminal Copy Mode")
             case .focusLeft: return String(localized: "shortcut.focusPaneLeft.label", defaultValue: "Focus Pane Left")
             case .focusRight: return String(localized: "shortcut.focusPaneRight.label", defaultValue: "Focus Pane Right")
@@ -245,6 +247,8 @@ enum KeyboardShortcutSettings {
                 return StoredShortcut(key: "1", command: false, shift: false, option: false, control: true)
             case .newSurface:
                 return StoredShortcut(key: "t", command: true, shift: false, option: false, control: false)
+            case .openLazygitFloating:
+                return StoredShortcut(key: "", command: false, shift: false, option: false, control: false)
             case .toggleTerminalCopyMode:
                 return StoredShortcut(key: "m", command: true, shift: true, option: false, control: false)
             case .selectWorkspaceByNumber:
@@ -290,6 +294,10 @@ enum KeyboardShortcutSettings {
 
         func tooltip(_ base: String) -> String {
             "\(base) (\(displayedShortcutString(for: KeyboardShortcutSettings.shortcut(for: self))))"
+        }
+
+        var hasDefaultBinding: Bool {
+            !defaultShortcut.key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
 
         var usesNumberedDigitMatching: Bool {
@@ -1858,6 +1866,9 @@ struct StoredShortcut: Codable, Equatable {
     }
 
     var displayString: String {
+        if key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return String(localized: "shortcut.unassigned", defaultValue: "Not Set")
+        }
         if let secondStroke {
             return "\(firstStroke.displayString) \(secondStroke.displayString)"
         }

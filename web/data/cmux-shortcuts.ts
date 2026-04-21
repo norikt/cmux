@@ -66,6 +66,12 @@ export const shortcutCategories: ShortcutCategory[] = [
     blurbKey: "surfacesBlurb",
     shortcuts: [
       { id: "newSurface", combos: [["⌘", "T"]], description: { en: "New surface", ja: "新規サーフェス" } },
+      {
+        id: "openLazygitFloating",
+        combos: [["Not Set"]],
+        description: { en: "Lazygit floating window", ja: "Lazygit浮動ウィンドウ" },
+        note: { en: "assign in Settings > Keyboard Shortcuts", ja: "設定 > Keyboard Shortcuts で割り当て" },
+      },
       { id: "nextSurface", combos: [["⌘", "⇧", "]"]], description: { en: "Next surface", ja: "次のサーフェス" } },
       { id: "prevSurface", combos: [["⌘", "⇧", "["]], description: { en: "Previous surface", ja: "前のサーフェス" } },
       { id: "selectSurfaceByNumber", combos: [["⌃", "1…9"]], description: { en: "Select surface 1…9", ja: "サーフェス1…9を選択" } },

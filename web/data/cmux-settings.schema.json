@@ -553,6 +553,7 @@
               "closeWorkspace",
               "reopenClosedBrowserPanel",
               "newSurface",
+              "openLazygitFloating",
               "toggleTerminalCopyMode",
               "focusLeft",
               "focusRight",

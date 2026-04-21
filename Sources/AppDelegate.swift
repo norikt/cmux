@@ -11448,6 +11448,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        if matchConfiguredShortcut(event: event, action: .openLazygitFloating) {
+            return runLazygitFloatingShortcut(event: event)
+        }
+
         // Open browser: Cmd+Shift+L
         if matchConfiguredShortcut(event: event, action: .openBrowser) {
             _ = openBrowserAndFocusAddressBar(insertAtEnd: true)
@@ -11588,6 +11592,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         return false
+    }
+
+    private func runLazygitFloatingShortcut(event: NSEvent) -> Bool {
+        runConfiguredFloatingCommandShortcut(event: event) { command in
+            let commandName = command.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let shellCommand = command.command?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return commandName == "lazygit" || shellCommand == "lazygit"
+        }
+    }
+
+    private func runConfiguredFloatingCommandShortcut(
+        event: NSEvent,
+        matcher: (CmuxCommandDefinition) -> Bool
+    ) -> Bool {
+        let routedManager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
+        let configStore = CmuxConfigStore()
+        if let routedManager {
+            configStore.wireDirectoryTracking(tabManager: routedManager)
+        }
+        configStore.loadAll()
+
+        guard let command = configStore.loadedCommands.first(where: { command in
+            command.window?.mode == .floating && matcher(command)
+        }) else {
+            NSSound.beep()
+            return true
+        }
+
+        let rawCwd = routedManager?.selectedWorkspace?.currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseCwd = (rawCwd?.isEmpty == false)
+            ? rawCwd!
+            : FileManager.default.homeDirectoryForCurrentUser.path
+
+        if let routedManager {
+            CmuxConfigExecutor.execute(
+                command: command,
+                tabManager: routedManager,
+                baseCwd: baseCwd,
+                configSourcePath: configStore.commandSourcePaths[command.id],
+                globalConfigPath: configStore.globalConfigPath
+            )
+        } else {
+            NSSound.beep()
+        }
+        return true
     }
 
     private func shouldSuppressSplitShortcutForTransientTerminalFocusState(direction: SplitDirection) -> Bool {
@@ -12370,6 +12419,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func matchConfiguredShortcut(event: NSEvent, action: KeyboardShortcutSettings.Action) -> Bool {
         let shortcut = KeyboardShortcutSettings.shortcut(for: action)
+        guard !shortcut.key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
         if let prefix = activeConfiguredShortcutChordPrefixForCurrentEvent {
             guard let secondStroke = shortcut.secondStroke,
                   shortcut.firstStroke == prefix else {

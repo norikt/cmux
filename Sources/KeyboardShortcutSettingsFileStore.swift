@@ -1345,11 +1345,17 @@ final class CmuxSettingsFileStore {
     }
 
     private static func defaultTemplateSections() -> [[String: Any]] {
-        let shortcutsBindings = Dictionary(
-            uniqueKeysWithValues: KeyboardShortcutSettings.Action.allCases.map { action in
-                (action.rawValue, shortcutTemplateValue(action.defaultShortcut, usesNumberedDigits: action.usesNumberedDigitMatching))
+        let shortcutBindingPairs: [(String, Any)] = KeyboardShortcutSettings.Action.allCases.compactMap { action in
+                guard action.hasDefaultBinding else { return nil }
+                return (
+                    action.rawValue,
+                    shortcutTemplateValue(
+                        action.defaultShortcut,
+                        usesNumberedDigits: action.usesNumberedDigitMatching
+                    )
+                )
             }
-        )
+        let shortcutsBindings = Dictionary(uniqueKeysWithValues: shortcutBindingPairs)
 
         return [
             [

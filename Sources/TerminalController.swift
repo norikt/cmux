@@ -10,6 +10,7 @@ extension Notification.Name {
     static let terminalSurfaceHostedViewDidMoveToWindow = Notification.Name("cmux.terminalSurfaceHostedViewDidMoveToWindow")
     static let mainWindowContextsDidChange = Notification.Name("cmux.mainWindowContextsDidChange")
     static let browserDownloadEventDidArrive = Notification.Name("cmux.browserDownloadEventDidArrive")
+    static let reactGrabDidCopySelection = Notification.Name("cmux.reactGrabDidCopySelection")
 }
 
 /// Unix socket-based controller for programmatic terminal control
@@ -388,8 +389,7 @@ class TerminalController {
         label: String,
         url: URL,
         status: SidebarPullRequestStatus,
-        branch: String?,
-        checks: SidebarPullRequestChecksStatus?
+        branch: String?
     ) -> Bool {
         guard let current else { return true }
         let normalizedBranch = branch?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -405,24 +405,12 @@ class TerminalController {
             }
             return current.branch
         }()
-        let effectiveChecks: SidebarPullRequestChecksStatus? = {
-            if let checks {
-                return checks
-            }
-            guard current.number == number,
-                  current.label == label,
-                  current.url == url,
-                  current.status == status else {
-                return nil
-            }
-            return current.checks
-        }()
         return current.number != number
             || current.label != label
             || current.url != url
             || current.status != status
             || current.branch != effectiveBranch
-            || current.checks != effectiveChecks
+            || current.isStale
     }
 
     nonisolated static func shouldReplacePorts(current: [Int]?, next: [Int]) -> Bool {
@@ -1837,6 +1825,9 @@ class TerminalController {
         case "report_shell_state":
             return reportShellState(args)
 
+        case "report_pr_action":
+            return reportPullRequestAction(args)
+
         case "report_pwd":
             return reportPwd(args)
 
@@ -2066,6 +2057,32 @@ class TerminalController {
                     "required": accessMode.requiresPasswordAuth
                 ]
             )
+        case "auth.status":
+            return v2Ok(id: id, result: v2AuthStatusPayload(timedOut: false))
+        case "auth.begin_sign_in":
+            // Fire the popup on main, then block the socket worker thread
+            // until AuthManager.$isAuthenticated flips to true (or the
+            // timeout elapses). The RPC reply is the callback — no client
+            // polling required.
+            let timeoutSeconds = (params["timeout_seconds"] as? Double) ?? 300
+            let semaphore = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var signedIn = false
+            Task { @MainActor in
+                signedIn = await AuthManager.shared.beginSignInAndAwait(
+                    timeout: timeoutSeconds
+                )
+                semaphore.signal()
+            }
+            semaphore.wait()
+            return v2Ok(id: id, result: v2AuthStatusPayload(timedOut: !signedIn))
+        case "auth.sign_out":
+            let semaphore = DispatchSemaphore(value: 0)
+            Task { @MainActor in
+                _ = await AuthManager.shared.signOutAndAwait(timeout: 5)
+                semaphore.signal()
+            }
+            semaphore.wait()
+            return v2Ok(id: id, result: v2AuthStatusPayload(timedOut: false))
 
         // Windows
         case "window.list":
@@ -2467,6 +2484,9 @@ class TerminalController {
             "system.identify",
             "system.tree",
             "auth.login",
+            "auth.status",
+            "auth.begin_sign_in",
+            "auth.sign_out",
             "window.list",
             "window.current",
             "window.focus",
@@ -2950,6 +2970,40 @@ class TerminalController {
     // MARK: - V2 Helpers (encoding + result plumbing)
     // MARK: - V2 Helpers (encoding + result plumbing)
 
+    private func v2AuthStatusPayload(timedOut: Bool) -> [String: Any] {
+        var result: [String: Any] = [:]
+        v2MainSync {
+            let manager = AuthManager.shared
+            var status: [String: Any] = [
+                "signed_in": manager.isAuthenticated,
+                "is_restoring_session": manager.isRestoringSession,
+                "is_loading": manager.isLoading,
+                "timed_out": timedOut
+            ]
+            if let user = manager.currentUser {
+                var userDict: [String: Any] = ["id": user.id]
+                if let email = user.primaryEmail { userDict["email"] = email }
+                if let name = user.displayName { userDict["display_name"] = name }
+                status["user"] = userDict
+            }
+            if let teamID = manager.resolvedTeamID {
+                status["selected_team_id"] = teamID
+            }
+            if !manager.availableTeams.isEmpty {
+                status["teams"] = manager.availableTeams.map { team -> [String: Any] in
+                    var dict: [String: Any] = [
+                        "id": team.id,
+                        "display_name": team.displayName
+                    ]
+                    if let slug = team.slug { dict["slug"] = slug }
+                    return dict
+                }
+            }
+            result = status
+        }
+        return result
+    }
+
     private func v2OrNull(_ value: Any?) -> Any {
         // Avoid relying on `?? NSNull()` inference (Swift toolchains can disagree).
         if let value { return value }
@@ -3402,18 +3456,36 @@ class TerminalController {
         let title = (requestedTitle?.isEmpty == false) ? requestedTitle : nil
         let description = v2RawString(params, "description")
 
+        // Decode optional layout param (same JSON schema as cmux.json layout field).
+        // Validate before creating the workspace so malformed layouts fail fast.
+        var layoutNode: CmuxLayoutNode?
+        if let rawLayout = params["layout"] {
+            guard JSONSerialization.isValidJSONObject(rawLayout),
+                  let layoutData = try? JSONSerialization.data(withJSONObject: rawLayout) else {
+                return .err(code: "invalid_params", message: "layout must be a valid JSON object", data: nil)
+            }
+            do {
+                layoutNode = try JSONDecoder().decode(CmuxLayoutNode.self, from: layoutData)
+            } catch {
+                return .err(code: "invalid_params", message: "Invalid layout: \(error.localizedDescription)", data: nil)
+            }
+        }
+
         var newId: UUID?
         let shouldFocus = v2FocusAllowed()
         v2MainSync {
             let ws = tabManager.addWorkspace(
                 title: title,
                 workingDirectory: cwd,
-                initialTerminalCommand: initialCommand,
-                initialTerminalEnvironment: initialEnv,
+                initialTerminalCommand: layoutNode == nil ? initialCommand : nil,
+                initialTerminalEnvironment: layoutNode == nil ? initialEnv : [:],
                 select: shouldFocus,
                 eagerLoadTerminal: !shouldFocus
             )
             ws.setCustomDescription(description)
+            if let layoutNode {
+                ws.applyCustomLayout(layoutNode, baseCwd: cwd ?? ws.currentDirectory)
+            }
             newId = ws.id
         }
 
@@ -11428,13 +11500,14 @@ class TerminalController {
           clear_progress [--tab=X] - Clear progress bar
           report_git_branch <branch> [--status=dirty] [--tab=X] [--panel=Y] - Report git branch
           clear_git_branch [--tab=X] [--panel=Y] - Clear git branch
-          report_pr <number> <url> [--label=PR] [--state=open|merged|closed] [--branch=<name>] [--checks=pass|fail|pending] [--tab=X] [--panel=Y] - Report pull request / review item
-          report_review <number> <url> [--label=MR] [--state=open|merged|closed] [--checks=pass|fail|pending] [--tab=X] [--panel=Y] - Alias for provider-specific review item
+          report_pr <number> <url> [--label=PR] [--state=open|merged|closed] [--branch=<name>] [--tab=X] [--panel=Y] - Report pull request / review item
+          report_review <number> <url> [--label=MR] [--state=open|merged|closed] [--tab=X] [--panel=Y] - Alias for provider-specific review item
           clear_pr [--tab=X] [--panel=Y] - Clear pull request
           report_ports <port1> [port2...] [--tab=X] [--panel=Y] - Report listening ports
           report_tty <tty_name> [--tab=X] [--panel=Y] - Register TTY for batched port scanning
           ports_kick [--tab=X] [--panel=Y] [--reason=command|refresh] - Request batched port scan for panel
           report_shell_state <prompt|running> [--tab=X] [--panel=Y] - Report whether the shell is idle at a prompt or running a command
+          report_pr_action <merge|close|reopen|create|checkout|ready|edit|view> [--target=X] [--tab=X] [--panel=Y] - Hint that a PR-affecting command completed in the panel
           report_pwd <path> [--tab=X] [--panel=Y] - Report current working directory
           clear_ports [--tab=X] [--panel=Y] - Clear listening ports
           sidebar_state [--tab=X] - Dump sidebar metadata
@@ -15122,7 +15195,7 @@ class TerminalController {
     private func reportPullRequest(_ args: String) -> String {
         let parsed = parseOptions(args)
         guard parsed.positional.count >= 2 else {
-            return "ERROR: Missing pull request number or URL — usage: report_pr <number> <url> [--label=PR] [--state=open|merged|closed] [--branch=<name>] [--checks=pass|fail|pending] [--tab=X] [--panel=Y]"
+            return "ERROR: Missing pull request number or URL — usage: report_pr <number> <url> [--label=PR] [--state=open|merged|closed] [--branch=<name>] [--tab=X] [--panel=Y]"
         }
 
         let rawNumber = parsed.positional[0].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -15143,20 +15216,13 @@ class TerminalController {
             return "ERROR: Invalid pull request state '\(statusRaw)' — use: open, merged, closed"
         }
         let branch = normalizedOptionValue(parsed.options["branch"])
-
-        let checks: SidebarPullRequestChecksStatus?
-        if let rawChecks = normalizedOptionValue(parsed.options["checks"]) {
-            guard let parsedChecks = SidebarPullRequestChecksStatus(rawValue: rawChecks.lowercased()) else {
-                return "ERROR: Invalid pull request checks '\(rawChecks)' — use: pass, fail, pending"
-            }
-            checks = parsedChecks
-        } else {
-            checks = nil
+        if normalizedOptionValue(parsed.options["checks"]) != nil {
+            return "ERROR: Unsupported option '--checks' — pull request checks are no longer tracked"
         }
 
         let labelRaw = normalizedOptionValue(parsed.options["label"]) ?? "PR"
         guard !labelRaw.isEmpty else {
-            return "ERROR: Invalid review label — usage: report_pr <number> <url> [--label=PR] [--state=open|merged|closed] [--branch=<name>] [--checks=pass|fail|pending] [--tab=X] [--panel=Y]"
+            return "ERROR: Invalid review label — usage: report_pr <number> <url> [--label=PR] [--state=open|merged|closed] [--branch=<name>] [--tab=X] [--panel=Y]"
         }
         let label = String(labelRaw.prefix(16))
 
@@ -15165,7 +15231,7 @@ class TerminalController {
         return schedulePanelMetadataMutation(
             args: args,
             options: parsed.options,
-            missingPanelUsage: "report_pr <number> <url> [--label=PR] [--state=open|merged|closed] [--branch=<name>] [--checks=pass|fail|pending] [--tab=X] [--panel=Y]"
+            missingPanelUsage: "report_pr <number> <url> [--label=PR] [--state=open|merged|closed] [--branch=<name>] [--tab=X] [--panel=Y]"
         ) { tab, surfaceId in
             guard Self.shouldReplacePullRequest(
                 current: tab.panelPullRequests[surfaceId],
@@ -15173,8 +15239,7 @@ class TerminalController {
                 label: label,
                 url: url,
                 status: status,
-                branch: branch,
-                checks: checks
+                branch: branch
             ) else {
                 return
             }
@@ -15185,8 +15250,7 @@ class TerminalController {
                 label: label,
                 url: url,
                 status: status,
-                branch: branch,
-                checks: checks
+                branch: branch
             )
         }
     }
@@ -15381,6 +15445,34 @@ class TerminalController {
             tabManager.updateSurfaceShellActivity(tabId: tab.id, surfaceId: surfaceId, state: state)
         }
         return result
+    }
+
+    private func reportPullRequestAction(_ args: String) -> String {
+        let parsed = parseOptions(args)
+        guard let rawAction = parsed.positional.first, !rawAction.isEmpty else {
+            return "ERROR: Missing PR action — usage: report_pr_action <merge|close|reopen|create|checkout|ready|edit|view> [--target=X] [--tab=X] [--panel=Y]"
+        }
+
+        let action = rawAction.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let validActions = Set(["merge", "close", "reopen", "create", "checkout", "ready", "edit", "view"])
+        guard validActions.contains(action) else {
+            return "ERROR: Invalid PR action '\(rawAction)'"
+        }
+
+        let target = normalizedOptionValue(parsed.options["target"])
+        return schedulePanelMetadataMutation(
+            args: args,
+            options: parsed.options,
+            missingPanelUsage: "report_pr_action <merge|close|reopen|create|checkout|ready|edit|view> [--target=X] [--tab=X] [--panel=Y]"
+        ) { tab, surfaceId in
+            guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: tab.id) else { return }
+            tabManager.handleWorkspacePullRequestCommandHint(
+                tabId: tab.id,
+                surfaceId: surfaceId,
+                action: action,
+                target: target
+            )
+        }
     }
 
     private func clearPorts(_ args: String) -> String {
@@ -15585,11 +15677,9 @@ class TerminalController {
             if let pr = tab.sidebarPullRequestsInDisplayOrder().first {
                 lines.append("pr=#\(pr.number) \(pr.status.rawValue) \(pr.url.absoluteString)")
                 lines.append("pr_label=\(pr.label)")
-                lines.append("pr_checks=\(pr.checks?.rawValue ?? "none")")
             } else {
                 lines.append("pr=none")
                 lines.append("pr_label=none")
-                lines.append("pr_checks=none")
             }
 
             if tab.listeningPorts.isEmpty {

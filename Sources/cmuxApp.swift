@@ -96,6 +96,23 @@ enum PaneFirstClickFocusSettings {
     }
 }
 
+enum TerminalScrollBarSettings {
+    static let showScrollBarKey = "terminal.showScrollBar"
+    static let defaultShowScrollBar = true
+    static let didChangeNotification = Notification.Name("cmux.terminalScrollBarSettingsDidChange")
+
+    static func isVisible(defaults: UserDefaults = .standard) -> Bool {
+        if defaults.object(forKey: showScrollBarKey) == nil {
+            return defaultShowScrollBar
+        }
+        return defaults.bool(forKey: showScrollBarKey)
+    }
+
+    static func notifyDidChange(notificationCenter: NotificationCenter = .default) {
+        notificationCenter.post(name: didChangeNotification, object: nil)
+    }
+}
+
 enum UITestLaunchManifest {
     static let argumentName = "-cmuxUITestLaunchManifest"
 
@@ -139,6 +156,7 @@ struct cmuxApp: App {
     @StateObject private var notificationStore = TerminalNotificationStore.shared
     @StateObject private var sidebarState = SidebarState()
     @StateObject private var sidebarSelectionState = SidebarSelectionState()
+    @StateObject private var fileExplorerState = FileExplorerState()
     @StateObject private var cmuxConfigStore = CmuxConfigStore()
     @StateObject private var keyboardShortcutSettingsObserver = KeyboardShortcutSettingsObserver.shared
     private let primaryWindowId = UUID()
@@ -229,11 +247,15 @@ struct cmuxApp: App {
         }
 
         if getenv("TERM") == nil {
-            setenv("TERM", "xterm-ghostty", 1)
+            setenv("TERM", TerminalSurface.managedTerminalType, 1)
+        }
+
+        if getenv("COLORTERM") == nil {
+            setenv("COLORTERM", TerminalSurface.managedColorTerm, 1)
         }
 
         if getenv("TERM_PROGRAM") == nil {
-            setenv("TERM_PROGRAM", "ghostty", 1)
+            setenv("TERM_PROGRAM", TerminalSurface.managedTerminalProgram, 1)
         }
 
         if let resourcesDir = getenv("GHOSTTY_RESOURCES_DIR").flatMap({ String(cString: $0) }) {
@@ -319,6 +341,7 @@ struct cmuxApp: App {
                 .environmentObject(notificationStore)
                 .environmentObject(sidebarState)
                 .environmentObject(sidebarSelectionState)
+                .environmentObject(fileExplorerState)
                 .environmentObject(cmuxConfigStore)
                 .onAppear {
 #if DEBUG
@@ -329,6 +352,7 @@ struct cmuxApp: App {
                     // Start the Unix socket controller for programmatic access
                     updateSocketController()
                     appDelegate.configure(tabManager: tabManager, notificationStore: notificationStore, sidebarState: sidebarState)
+                    appDelegate.fileExplorerState = fileExplorerState
                     cmuxConfigStore.wireDirectoryTracking(tabManager: tabManager)
                     cmuxConfigStore.loadAll()
                     applyAppearance()
@@ -489,6 +513,9 @@ struct cmuxApp: App {
                     }
                     Button("Split Button Layout Debug…") {
                         SplitButtonLayoutDebugWindowController.shared.show()
+                    }
+                    Button("File Explorer Style Debug…") {
+                        FileExplorerStyleDebugWindowController.shared.show()
                     }
                     Button("Open All Debug Windows") {
                         openAllDebugWindows()
@@ -707,7 +734,9 @@ struct cmuxApp: App {
                 }
 
                 splitCommandButton(title: String(localized: "menu.view.toggleReactGrab", defaultValue: "Toggle React Grab"), shortcut: menuShortcut(for: .toggleReactGrab)) {
-                    activeTabManager.toggleReactGrabFocusedBrowser()
+                    if !activeTabManager.toggleReactGrabFromCurrentFocus() {
+                        NSSound.beep()
+                    }
                 }
 
                 splitCommandButton(title: String(localized: "menu.view.zoomIn", defaultValue: "Zoom In"), shortcut: menuShortcut(for: .browserZoomIn)) {
@@ -808,6 +837,10 @@ struct cmuxApp: App {
                     showNotificationsPopover()
                 }
             }
+        }
+
+        Window(String(localized: "settings.config.windowTitle", defaultValue: "Config"), id: ConfigSettingsView.windowID) {
+            ConfigSettingsView()
         }
     }
 
@@ -1149,6 +1182,7 @@ private let cmuxAuxiliaryWindowIdentifiers: Set<String> = [
 func cmuxWindowShouldOwnCloseShortcut(_ window: NSWindow?) -> Bool {
     guard let identifier = window?.identifier?.rawValue else { return false }
     return cmuxAuxiliaryWindowIdentifiers.contains(identifier)
+        || identifier.hasPrefix("cmux.floating-terminal.")
 }
 
 private enum SettingsAboutWindowKind: String, CaseIterable, Identifiable {
@@ -1631,6 +1665,7 @@ private enum DebugWindowConfigSnapshot {
         shortcutHintPaneTabYOffset=\(String(format: "%.1f", doubleValue(defaults, key: ShortcutHintDebugSettings.paneHintYKey, fallback: ShortcutHintDebugSettings.defaultPaneHintY)))
         shortcutHintAlwaysShow=\(boolValue(defaults, key: ShortcutHintDebugSettings.alwaysShowHintsKey, fallback: ShortcutHintDebugSettings.defaultAlwaysShowHints))
         shortcutHintShowOnCommandHold=\(boolValue(defaults, key: ShortcutHintDebugSettings.showHintsOnCommandHoldKey, fallback: ShortcutHintDebugSettings.defaultShowHintsOnCommandHold))
+        shortcutHintShowOnControlHold=\(boolValue(defaults, key: ShortcutHintDebugSettings.showHintsOnControlHoldKey, fallback: ShortcutHintDebugSettings.defaultShowHintsOnControlHold))
         """
 
         let backgroundPayload = """
@@ -2626,6 +2661,117 @@ enum SettingsNavigationRequest {
     static func target(from notification: Notification) -> SettingsNavigationTarget? {
         guard let rawValue = notification.userInfo?[targetKey] as? String else { return nil }
         return SettingsNavigationTarget(rawValue: rawValue)
+    }
+}
+
+// MARK: - File Explorer Style Debug
+
+private struct FileExplorerStyleDebugView: View {
+    @AppStorage("fileExplorer.style") private var styleRawValue: Int = 0
+
+    private var currentStyle: FileExplorerStyle {
+        FileExplorerStyle(rawValue: styleRawValue) ?? .liquidGlass
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("File Explorer Style")
+                .font(.headline)
+
+            ForEach(FileExplorerStyle.allCases, id: \.rawValue) { style in
+                HStack(spacing: 8) {
+                    Button(action: {
+                        styleRawValue = style.rawValue
+                        // Post notification so outline view reloads with new style
+                        NotificationCenter.default.post(name: .fileExplorerStyleDidChange, object: nil)
+                    }) {
+                        HStack(spacing: 8) {
+                            Image(systemName: styleRawValue == style.rawValue ? "checkmark.circle.fill" : "circle")
+                                .foregroundColor(styleRawValue == style.rawValue ? .accentColor : .secondary)
+                                .frame(width: 16)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(style.label)
+                                    .font(.system(size: 13, weight: .medium))
+                                Text(styleDescription(style))
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(styleRawValue == style.rawValue
+                                    ? Color.accentColor.opacity(0.1)
+                                    : Color.clear)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Current: \(currentStyle.label)")
+                    .font(.system(size: 11, weight: .medium))
+                Text("Row: \(Int(currentStyle.rowHeight))pt, Indent: \(Int(currentStyle.indentation))pt, Icon: \(Int(currentStyle.iconSize))pt")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(16)
+        .frame(width: 320)
+    }
+
+    private func styleDescription(_ style: FileExplorerStyle) -> String {
+        switch style {
+        case .liquidGlass: return "Modern macOS, vibrancy, rounded selections"
+        case .highDensity: return "VS Code, compact rows, edge-to-edge"
+        case .terminalStealth: return "Monospace, border selection, desaturated"
+        case .proStudio: return "Logic Pro, chunky rows, pill selection"
+        case .finder: return "Finder sidebar, filled icons, hover tint"
+        }
+    }
+}
+
+extension Notification.Name {
+    static let fileExplorerStyleDidChange = Notification.Name("fileExplorerStyleDidChange")
+    static let titlebarShortcutHintsVisibilityChanged = Notification.Name("titlebarShortcutHintsVisibilityChanged")
+}
+
+private final class FileExplorerStyleDebugWindowController: NSWindowController, NSWindowDelegate {
+    static let shared = FileExplorerStyleDebugWindowController()
+
+    private init() {
+        let window = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 340, height: 380),
+            styleMask: [.titled, .closable, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "File Explorer Style"
+        window.titleVisibility = .visible
+        window.titlebarAppearsTransparent = false
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.identifier = NSUserInterfaceItemIdentifier("cmux.fileExplorerStyleDebug")
+        window.center()
+        window.contentView = NSHostingView(rootView: FileExplorerStyleDebugView())
+        AppDelegate.shared?.applyWindowDecorations(to: window)
+        super.init(window: window)
+        window.delegate = self
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func show() {
+        window?.center()
+        window?.makeKeyAndOrderFront(nil)
     }
 }
 
@@ -3656,12 +3802,43 @@ enum AppIconMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum AppIconLaunchState {
+    private static let lock = NSLock()
+    private static var didFinishLaunching = false
+
+    static func markDidFinishLaunching() {
+        lock.lock()
+        defer { lock.unlock() }
+        didFinishLaunching = true
+    }
+
+    static func isApplicationFinishedLaunching() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let hasFinishedLaunching = didFinishLaunching
+        return hasFinishedLaunching
+    }
+}
+
 enum AppIconSettings {
     static let modeKey = "appIconMode"
     static let defaultMode: AppIconMode = .automatic
     private static let dockTileIconDidChangeNotification = Notification.Name("com.cmuxterm.appIconDidChange")
+    private static var liveEnvironmentProvider: () -> Environment = { .live() }
+
+    private static func isRunningUnderXCTest(_ env: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        if env["XCTestConfigurationFilePath"] != nil { return true }
+        if env["XCTestBundlePath"] != nil { return true }
+        if env["XCTestSessionIdentifier"] != nil { return true }
+        if env["XCInjectBundle"] != nil { return true }
+        if env["XCInjectBundleInto"] != nil { return true }
+        if env["DYLD_INSERT_LIBRARIES"]?.contains("libXCTest") == true { return true }
+        if env.keys.contains(where: { $0.hasPrefix("CMUX_UI_TEST_") }) { return true }
+        return false
+    }
 
     struct Environment {
+        let isApplicationFinishedLaunching: () -> Bool
         let imageForMode: (AppIconMode) -> NSImage?
         let setApplicationIconImage: (NSImage) -> Void
         let startAppearanceObservation: () -> Void
@@ -3670,6 +3847,9 @@ enum AppIconSettings {
 
         static func live() -> Self {
             Self(
+                isApplicationFinishedLaunching: {
+                    AppIconLaunchState.isApplicationFinishedLaunching()
+                },
                 imageForMode: { mode in
                     guard let imageName = mode.imageName else { return nil }
                     return NSImage(named: imageName)
@@ -3684,6 +3864,7 @@ enum AppIconSettings {
                     AppIconAppearanceObserver.shared.stopObserving()
                 },
                 notifyDockTilePlugin: {
+                    guard !AppIconSettings.isRunningUnderXCTest() else { return }
                     DistributedNotificationCenter.default().postNotificationName(
                         AppIconSettings.dockTileIconDidChangeNotification,
                         object: nil,
@@ -3703,7 +3884,13 @@ enum AppIconSettings {
         return mode
     }
 
-    static func applyIcon(_ mode: AppIconMode, environment: Environment = .live()) {
+    static func applyIcon(_ mode: AppIconMode, environment: Environment? = nil) {
+        let environment = environment ?? liveEnvironmentProvider()
+        // Tahoe can crash or wedge when app icon work runs during App.init(),
+        // so leave settings replay to update defaults only and let AppDelegate
+        // apply the resolved icon once didFinishLaunching begins.
+        guard environment.isApplicationFinishedLaunching() else { return }
+
         switch mode {
         case .automatic:
             environment.startAppearanceObservation()
@@ -3719,35 +3906,128 @@ enum AppIconSettings {
 
         environment.notifyDockTilePlugin()
     }
+
+    static func setLiveEnvironmentProviderForTesting(_ provider: @escaping () -> Environment) {
+        liveEnvironmentProvider = provider
+    }
+
+    static func resetLiveEnvironmentProviderForTesting() {
+        liveEnvironmentProvider = { .live() }
+    }
 }
 
-final class AppIconAppearanceObserver: NSObject {
-    static let shared = AppIconAppearanceObserver()
-    private var observation: NSKeyValueObservation?
+protocol AppIconAppearanceObservation: AnyObject {
+    func invalidate()
+}
 
-    private override init() { super.init() }
+extension NSKeyValueObservation: AppIconAppearanceObservation {}
+
+final class AppIconAppearanceObserver: NSObject {
+    struct Environment {
+        let isApplicationFinishedLaunching: () -> Bool
+        let startEffectiveAppearanceObservation: (@escaping () -> Void) -> AppIconAppearanceObservation?
+        let addDidFinishLaunchingObserver: (@escaping () -> Void) -> NSObjectProtocol
+        let removeObserver: (NSObjectProtocol) -> Void
+        let currentAppearanceIsDark: () -> Bool?
+        let imageForName: (String) -> NSImage?
+        let setApplicationIconImage: (NSImage) -> Void
+
+        static func live() -> Self {
+            Self(
+                isApplicationFinishedLaunching: {
+                    AppIconLaunchState.isApplicationFinishedLaunching()
+                },
+                startEffectiveAppearanceObservation: { handler in
+                    guard let app = NSApp else { return nil }
+                    return app.observe(\.effectiveAppearance, options: []) { _, _ in
+                        DispatchQueue.main.async {
+                            handler()
+                        }
+                    }
+                },
+                addDidFinishLaunchingObserver: { handler in
+                    NotificationCenter.default.addObserver(
+                        forName: NSApplication.didFinishLaunchingNotification,
+                        object: nil,
+                        queue: .main
+                    ) { _ in
+                        handler()
+                    }
+                },
+                removeObserver: { observer in
+                    NotificationCenter.default.removeObserver(observer)
+                },
+                currentAppearanceIsDark: {
+                    guard let app = NSApp else { return nil }
+                    return app.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                },
+                imageForName: { imageName in
+                    NSImage(named: imageName)
+                },
+                setApplicationIconImage: { icon in
+                    NSApplication.shared.applicationIconImage = icon
+                }
+            )
+        }
+    }
+
+    static let shared = AppIconAppearanceObserver()
+    private let environment: Environment
+    private var observation: AppIconAppearanceObservation?
+    private var launchObserver: NSObjectProtocol?
+    private var hasDeferredStartPending = false
+
+    init(environment: Environment = .live()) {
+        self.environment = environment
+        super.init()
+    }
 
     func startObserving() {
+        // Tahoe crashes if effectiveAppearance is touched during App.init(),
+        // so defer the first automatic-icon apply until launch completes.
+        if !environment.isApplicationFinishedLaunching() {
+            deferStartUntilLaunchIfNeeded()
+            return
+        }
+
+        cancelDeferredStart()
         applyIconForCurrentAppearance()
         guard observation == nil else { return }
-        observation = NSApp.observe(\.effectiveAppearance, options: []) { [weak self] _, _ in
-            DispatchQueue.main.async {
-                guard let self, self.observation != nil else { return }
-                self.applyIconForCurrentAppearance()
-            }
+        observation = environment.startEffectiveAppearanceObservation { [weak self] in
+            guard let self, self.observation != nil else { return }
+            self.applyIconForCurrentAppearance()
         }
     }
 
     func stopObserving() {
         observation?.invalidate()
         observation = nil
+        cancelDeferredStart()
+    }
+
+    private func deferStartUntilLaunchIfNeeded() {
+        hasDeferredStartPending = true
+        guard launchObserver == nil else { return }
+        launchObserver = environment.addDidFinishLaunchingObserver { [weak self] in
+            guard let self, self.hasDeferredStartPending else { return }
+            self.cancelDeferredStart()
+            self.startObserving()
+        }
+    }
+
+    private func cancelDeferredStart() {
+        hasDeferredStartPending = false
+        guard let launchObserver else { return }
+        environment.removeObserver(launchObserver)
+        self.launchObserver = nil
     }
 
     private func applyIconForCurrentAppearance() {
-        let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        guard environment.isApplicationFinishedLaunching() else { return }
+        guard let isDark = environment.currentAppearanceIsDark() else { return }
         let imageName = isDark ? "AppIconDark" : "AppIconLight"
-        if let icon = NSImage(named: imageName) {
-            NSApplication.shared.applicationIconImage = icon
+        if let icon = environment.imageForName(imageName) {
+            environment.setApplicationIconImage(icon)
         }
     }
 }
@@ -3811,6 +4091,30 @@ enum ClaudeCodeIntegrationSettings {
     }
 }
 
+enum CursorIntegrationSettings {
+    static let hooksEnabledKey = "cursorHooksEnabled"
+    static let defaultHooksEnabled = true
+
+    static func hooksEnabled(defaults: UserDefaults = .standard) -> Bool {
+        if defaults.object(forKey: hooksEnabledKey) == nil {
+            return defaultHooksEnabled
+        }
+        return defaults.bool(forKey: hooksEnabledKey)
+    }
+}
+
+enum GeminiIntegrationSettings {
+    static let hooksEnabledKey = "geminiHooksEnabled"
+    static let defaultHooksEnabled = true
+
+    static func hooksEnabled(defaults: UserDefaults = .standard) -> Bool {
+        if defaults.object(forKey: hooksEnabledKey) == nil {
+            return defaultHooksEnabled
+        }
+        return defaults.bool(forKey: hooksEnabledKey)
+    }
+}
+
 enum WelcomeSettings {
     static let shownKey = "cmuxWelcomeShown"
 }
@@ -3830,6 +4134,37 @@ enum TelemetrySettings {
     static let enabledForCurrentLaunch = isEnabled()
 }
 
+enum CmdClickMarkdownRouteSettings {
+    static let key = "openMarkdownInCmuxViewer"
+    static let defaultValue = false
+
+    static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: key) == nil ? defaultValue : defaults.bool(forKey: key)
+    }
+
+    /// Cheap extension check. Safe to call off the main thread before any
+    /// filesystem probe so remote/non-markdown paths can be filtered early.
+    static func isMarkdownPath(_ path: String) -> Bool {
+        let ext = (path as NSString).pathExtension.lowercased()
+        return ext == "md" || ext == "markdown" || ext == "mkd" || ext == "mdx"
+    }
+
+    static func shouldRoute(path: String) -> Bool {
+        guard isEnabled(), isMarkdownPath(path) else { return false }
+        // Match the `markdown.open` socket path: only route real, readable
+        // files. Rejects FIFOs, device nodes, sockets, symlinks to non-regular
+        // targets, and permission-denied paths so the viewer never opens into
+        // an unavailable state.
+        let resolved = (path as NSString).resolvingSymlinksInPath
+        guard FileManager.default.isReadableFile(atPath: resolved),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: resolved),
+              (attrs[.type] as? FileAttributeType) == .typeRegular else {
+            return false
+        }
+        return true
+    }
+}
+
 enum PreferredEditorSettings {
     static let key = "preferredEditorCommand"
 
@@ -3844,6 +4179,13 @@ enum PreferredEditorSettings {
 
     /// Open a file path with the user's preferred editor, falling back to system default.
     static func open(_ url: URL) {
+        if CmuxUITestCapture.appendLineIfConfigured(
+            envKey: "CMUX_UI_TEST_CAPTURE_OPEN_PATH",
+            line: url.path
+        ) {
+            return
+        }
+
         guard let command = resolvedCommand() else {
             NSWorkspace.shared.open(url)
             return
@@ -3874,6 +4216,152 @@ enum PreferredEditorSettings {
     }
 }
 
+enum CmuxUITestCapture {
+    static func appendLineIfConfigured(envKey: String, line: String) -> Bool {
+        guard let url = configuredURL(for: envKey) else { return false }
+        appendLine(line, to: url)
+        return true
+    }
+
+    static func mutateJSONObjectIfConfigured(
+        envKey: String,
+        _ update: (inout [String: Any]) -> Void
+    ) -> Bool {
+        guard let url = configuredURL(for: envKey) else { return false }
+        mutateJSONObject(at: url, update)
+        return true
+    }
+
+    private static func configuredURL(for envKey: String) -> URL? {
+        let env = ProcessInfo.processInfo.environment
+        guard let rawPath = env[envKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawPath.isEmpty else {
+            return nil
+        }
+        return URL(fileURLWithPath: rawPath)
+    }
+
+    private static func appendLine(_ line: String, to url: URL) {
+        ensureParentDirectory(for: url)
+        let payload = (line + "\n").data(using: .utf8) ?? Data()
+
+        if FileManager.default.fileExists(atPath: url.path) {
+            do {
+                let handle = try FileHandle(forWritingTo: url)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: payload)
+            } catch {
+                if let existing = try? Data(contentsOf: url) {
+                    var combined = existing
+                    combined.append(payload)
+                    try? combined.write(to: url, options: .atomic)
+                } else {
+                    try? payload.write(to: url, options: .atomic)
+                }
+            }
+            return
+        }
+
+        try? payload.write(to: url, options: .atomic)
+    }
+
+    private static func mutateJSONObject(
+        at url: URL,
+        _ update: (inout [String: Any]) -> Void
+    ) {
+        ensureParentDirectory(for: url)
+        var payload: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            payload = object
+        }
+        update(&payload)
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return
+        }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private static func ensureParentDirectory(for url: URL) {
+        let directory = url.deletingLastPathComponent()
+        guard !directory.path.isEmpty else { return }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+}
+
+enum CmuxRuntimeDebugCapture {
+    private struct Configuration {
+        let baseURL: URL
+        let token: String
+        let sessionID: String
+    }
+
+    private static let configuration: Configuration? = {
+        let env = ProcessInfo.processInfo.environment
+        guard let baseURLString = env["CMUX_RUNTIME_DEBUG_BASE_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let baseURL = URL(string: baseURLString),
+              let token = env["CMUX_RUNTIME_DEBUG_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty,
+              let sessionID = env["CMUX_RUNTIME_DEBUG_SESSION_ID"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sessionID.isEmpty else {
+            return nil
+        }
+        return Configuration(baseURL: baseURL, token: token, sessionID: sessionID)
+    }()
+
+    private static let lock = NSLock()
+    private static var sequence: Int = 0
+
+    static func logIfConfigured(
+        hypothesisID: String,
+        source: String,
+        name: String,
+        expected: String? = nil,
+        actual: String? = nil,
+        data: [String: Any] = [:]
+    ) {
+        guard let configuration else { return }
+
+        var payload: [String: Any] = [
+            "session_id": configuration.sessionID,
+            "hypothesis_id": hypothesisID,
+            "service": "cmux-macos",
+            "source": source,
+            "name": name,
+            "ts": ISO8601DateFormatter().string(from: Date()),
+            "mono_ms": ProcessInfo.processInfo.systemUptime * 1000,
+            "seq": nextSequence(),
+            "data": data
+        ]
+        if let expected {
+            payload["expected"] = expected
+        }
+        if let actual {
+            payload["actual"] = actual
+        }
+
+        guard JSONSerialization.isValidJSONObject(payload),
+              let requestBody = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
+            return
+        }
+
+        var request = URLRequest(url: configuration.baseURL.appendingPathComponent("api/logs"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(configuration.token, forHTTPHeaderField: "X-Debug-Token")
+        request.httpBody = requestBody
+
+        URLSession.shared.dataTask(with: request).resume()
+    }
+
+    private static func nextSequence() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        sequence += 1
+        return sequence
+    }
+}
 private func openCmuxSettingsFileInEditor() {
     let url = KeyboardShortcutSettings.settingsFileStore.settingsFileURLForEditing()
     PreferredEditorSettings.open(url)
@@ -3893,6 +4381,7 @@ struct SettingsView: View {
     private let pickerColumnWidth: CGFloat = 196
     private let notificationSoundControlWidth: CGFloat = 280
     private let shortcutChordsDocsURL = URL(string: "https://cmux.com/docs/keyboard-shortcuts#shortcut-chords")!
+    @Environment(\.openWindow) private var openWindow
 
     @AppStorage(LanguageSettings.languageKey) private var appLanguage = LanguageSettings.defaultLanguage.rawValue
     @AppStorage(AppearanceSettings.appearanceModeKey) private var appearanceMode = AppearanceSettings.defaultMode.rawValue
@@ -3904,9 +4393,14 @@ struct SettingsView: View {
     private var claudeCodeHooksEnabled = ClaudeCodeIntegrationSettings.defaultHooksEnabled
     @AppStorage(ClaudeCodeIntegrationSettings.customClaudePathKey)
     private var customClaudePath = ""
+    @AppStorage(CursorIntegrationSettings.hooksEnabledKey)
+    private var cursorHooksEnabled = CursorIntegrationSettings.defaultHooksEnabled
+    @AppStorage(GeminiIntegrationSettings.hooksEnabledKey)
+    private var geminiHooksEnabled = GeminiIntegrationSettings.defaultHooksEnabled
     @AppStorage(TelemetrySettings.sendAnonymousTelemetryKey)
     private var sendAnonymousTelemetry = TelemetrySettings.defaultSendAnonymousTelemetry
     @AppStorage(PreferredEditorSettings.key) private var preferredEditorCommand = ""
+    @AppStorage(CmdClickMarkdownRouteSettings.key) private var openMarkdownInCmuxViewer = CmdClickMarkdownRouteSettings.defaultValue
     @AppStorage("cmuxPortBase") private var cmuxPortBase = 9100
     @AppStorage("cmuxPortRange") private var cmuxPortRange = 10
     @AppStorage(BrowserSearchSettings.searchEngineKey) private var browserSearchEngine = BrowserSearchSettings.defaultSearchEngine.rawValue
@@ -3943,6 +4437,8 @@ struct SettingsView: View {
     private var closeWorkspaceOnLastSurfaceShortcut = LastSurfaceCloseShortcutSettings.defaultValue
     @AppStorage(PaneFirstClickFocusSettings.enabledKey)
     private var paneFirstClickFocusEnabled = PaneFirstClickFocusSettings.defaultEnabled
+    @AppStorage(TerminalScrollBarSettings.showScrollBarKey)
+    private var showTerminalScrollBar = TerminalScrollBarSettings.defaultShowScrollBar
     @AppStorage(WorkspaceAutoReorderSettings.key) private var workspaceAutoReorder = WorkspaceAutoReorderSettings.defaultValue
     @AppStorage(SidebarWorkspaceDetailSettings.hideAllDetailsKey)
     private var sidebarHideAllDetails = SidebarWorkspaceDetailSettings.defaultHideAllDetails
@@ -3961,6 +4457,8 @@ struct SettingsView: View {
     private var openSidebarPortLinksInCmuxBrowser = BrowserLinkOpenSettings.defaultOpenSidebarPortLinksInCmuxBrowser
     @AppStorage(ShortcutHintDebugSettings.showHintsOnCommandHoldKey)
     private var showShortcutHintsOnCommandHold = ShortcutHintDebugSettings.defaultShowHintsOnCommandHold
+    @AppStorage(ShortcutHintDebugSettings.showHintsOnControlHoldKey)
+    private var showShortcutHintsOnControlHold = ShortcutHintDebugSettings.defaultShowHintsOnControlHold
     @AppStorage("sidebarShowSSH") private var sidebarShowSSH = true
     @AppStorage("sidebarShowPorts") private var sidebarShowPorts = true
     @AppStorage("sidebarShowLog") private var sidebarShowLog = true
@@ -3973,6 +4471,7 @@ struct SettingsView: View {
     @AppStorage("sidebarMatchTerminalBackground") private var sidebarMatchTerminalBackground = false
 
     @ObservedObject private var notificationStore = TerminalNotificationStore.shared
+    @ObservedObject private var authManager = AuthManager.shared
     @StateObject private var keyboardShortcutSettingsObserver = KeyboardShortcutSettingsObserver.shared
     @State private var shortcutResetToken = UUID()
     @State private var topBlurOpacity: Double = 0
@@ -4052,6 +4551,17 @@ struct SettingsView: View {
         return String(
             localized: "settings.app.paneFirstClickFocus.subtitleOff",
             defaultValue: "When cmux is inactive, the first click only activates the window. Click again to focus the pane."
+        )
+    }
+
+    private var showTerminalScrollBarBinding: Binding<Bool> {
+        Binding(
+            get: { showTerminalScrollBar },
+            set: { newValue in
+                guard showTerminalScrollBar != newValue else { return }
+                showTerminalScrollBar = newValue
+                TerminalScrollBarSettings.notifyDidChange()
+            }
         )
     }
 
@@ -4468,13 +4978,20 @@ struct SettingsView: View {
 
     var body: some View {
         let _ = keyboardShortcutSettingsObserver.revision
+        let _ = Self.validateBypassedSettingsConfigurationReviews()
         ScrollViewReader { proxy in
             ZStack(alignment: .top) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    SettingsSectionHeader(title: String(localized: "settings.section.account", defaultValue: "Account"))
+                    SettingsCard {
+                        AuthSettingsRow(authManager: authManager)
+                    }
+
                     SettingsSectionHeader(title: String(localized: "settings.section.app", defaultValue: "App"))
                     SettingsCard {
                         SettingsCardRow(
+                            configurationReview: .json("app.language"),
                             String(localized: "settings.app.language", defaultValue: "Language"),
                             subtitle: appLanguage != LanguageSettings.languageAtLaunch.rawValue
                                 ? String(localized: "settings.app.language.restartSubtitle", defaultValue: "Restart cmux to apply")
@@ -4506,6 +5023,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         ThemePickerRow(
+                            configurationReview: .json("app.appearance"),
                             selectedMode: appearanceMode,
                             onSelect: { mode in
                                 appearanceMode = mode.rawValue
@@ -4515,6 +5033,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         AppIconPickerRow(
+                            configurationReview: .json("app.appIcon"),
                             selectedMode: appIconMode,
                             onSelect: { mode in
                                 appIconMode = mode.rawValue
@@ -4525,6 +5044,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsPickerRow(
+                            configurationReview: .json("app.newWorkspacePlacement"),
                             String(localized: "settings.app.newWorkspacePlacement", defaultValue: "New Workspace Placement"),
                             subtitle: selectedWorkspacePlacement.description,
                             controlWidth: pickerColumnWidth,
@@ -4538,6 +5058,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("app.minimalMode"),
                             String(localized: "settings.app.minimalMode", defaultValue: "Minimal Mode"),
                             subtitle: minimalModeSubtitle
                         ) {
@@ -4553,6 +5074,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("app.keepWorkspaceOpenWhenClosingLastSurface"),
                             String(localized: "settings.app.closeWorkspaceOnLastSurfaceShortcut", defaultValue: "Keep Workspace Open When Closing Last Surface"),
                             subtitle: closeWorkspaceOnLastSurfaceShortcutSubtitle
                         ) {
@@ -4564,6 +5086,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("app.focusPaneOnFirstClick"),
                             String(localized: "settings.app.paneFirstClickFocus", defaultValue: "Focus Pane on First Click"),
                             subtitle: paneFirstClickFocusSubtitle
                         ) {
@@ -4578,6 +5101,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("app.preferredEditor"),
                             String(localized: "settings.app.preferredEditor", defaultValue: "Open Files With"),
                             subtitle: String(localized: "settings.app.preferredEditor.subtitle", defaultValue: "Command to open files on Cmd-click. Leave empty for system default.")
                         ) {
@@ -4592,6 +5116,39 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .action,
+                            String(localized: "settings.app.configWindow", defaultValue: "Terminal Config"),
+                            subtitle: String(
+                                localized: "settings.app.configWindow.subtitle",
+                                defaultValue: "Open the cmux config, standalone Ghostty config, and merged preview in one utility window."
+                            )
+                        ) {
+                            Button(String(localized: "settings.app.configWindow.openButton", defaultValue: "Open Config Window")) {
+                                openWindow(id: ConfigSettingsView.windowID)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            configurationReview: .json("app.openMarkdownInCmuxViewer"),
+                            String(localized: "settings.app.openMarkdownInCmuxViewer", defaultValue: "Open Markdown in cmux Viewer"),
+                            subtitle: String(localized: "settings.app.openMarkdownInCmuxViewer.subtitle", defaultValue: "Cmd-clicking .md/.markdown/.mkd/.mdx files opens the cmux markdown viewer panel instead of the preferred editor.")
+                        ) {
+                            Toggle("", isOn: $openMarkdownInCmuxViewer)
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .accessibilityLabel(
+                                    String(localized: "settings.app.openMarkdownInCmuxViewer", defaultValue: "Open Markdown in cmux Viewer")
+                                )
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            configurationReview: .json("app.reorderOnNotification"),
                             String(localized: "settings.app.reorderOnNotification", defaultValue: "Reorder on Notification"),
                             subtitle: String(localized: "settings.app.reorderOnNotification.subtitle", defaultValue: "Move workspaces to the top when they receive a notification. Disable for stable shortcut positions.")
                         ) {
@@ -4603,6 +5160,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("notifications.dockBadge"),
                             String(localized: "settings.app.dockBadge", defaultValue: "Dock Badge"),
                             subtitle: String(localized: "settings.app.dockBadge.subtitle", defaultValue: "Show unread count on app icon (Dock and Cmd+Tab).")
                         ) {
@@ -4614,6 +5172,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("notifications.showInMenuBar"),
                             String(localized: "settings.app.showInMenuBar", defaultValue: "Show in Menu Bar"),
                             subtitle: String(localized: "settings.app.showInMenuBar.subtitle", defaultValue: "Keep cmux in the menu bar for unread notifications and quick actions.")
                         ) {
@@ -4628,6 +5187,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("notifications.unreadPaneRing"),
                             String(localized: "settings.notifications.paneRing.title", defaultValue: "Unread Pane Ring"),
                             subtitle: String(localized: "settings.notifications.paneRing.subtitle", defaultValue: "Show a blue ring around panes with unread notifications.")
                         ) {
@@ -4642,6 +5202,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("notifications.paneFlash"),
                             String(localized: "settings.notifications.paneFlash.title", defaultValue: "Pane Flash"),
                             subtitle: String(localized: "settings.notifications.paneFlash.subtitle", defaultValue: "Briefly flash a blue outline when cmux highlights a pane.")
                         ) {
@@ -4656,6 +5217,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .action,
                             "Desktop Notifications",
                             subtitle: notificationPermissionSubtitle
                         ) {
@@ -4680,6 +5242,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("notifications.sound", "notifications.customSoundFilePath"),
                             String(localized: "settings.notifications.sound.title", defaultValue: "Notification Sound"),
                             subtitle: String(localized: "settings.notifications.sound.subtitle", defaultValue: "Sound played when a notification arrives."),
                             controlWidth: notificationSoundControlWidth
@@ -4748,6 +5311,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("notifications.command"),
                             "Notification Command",
                             subtitle: "Run a shell command when a notification arrives. $CMUX_NOTIFICATION_TITLE, $CMUX_NOTIFICATION_SUBTITLE, $CMUX_NOTIFICATION_BODY are set."
                         ) {
@@ -4759,6 +5323,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("app.sendAnonymousTelemetry"),
                             String(localized: "settings.app.telemetry", defaultValue: "Send anonymous telemetry"),
                             subtitle: sendAnonymousTelemetry != telemetryValueAtLaunch
                                 ? String(localized: "settings.app.telemetry.subtitleChanged", defaultValue: "Change takes effect on next launch.")
@@ -4772,6 +5337,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("app.warnBeforeQuit"),
                             String(localized: "settings.app.warnBeforeQuit", defaultValue: "Warn Before Quit"),
                             subtitle: warnBeforeQuitShortcut
                                 ? String(localized: "settings.app.warnBeforeQuit.subtitleOn", defaultValue: "Show a confirmation before quitting with Cmd+Q.")
@@ -4785,6 +5351,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("app.renameSelectsExistingName"),
                             String(localized: "settings.app.renameSelectsName", defaultValue: "Rename Selects Existing Name"),
                             subtitle: commandPaletteRenameSelectAllOnFocus
                                 ? String(localized: "settings.app.renameSelectsName.subtitleOn", defaultValue: "Command Palette rename starts with all text selected.")
@@ -4798,6 +5365,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("app.commandPaletteSearchesAllSurfaces"),
                             String(localized: "settings.app.commandPaletteSearchAllSurfaces", defaultValue: "Command Palette Searches All Surfaces"),
                             subtitle: commandPaletteSearchAllSurfaces
                                 ? String(localized: "settings.app.commandPaletteSearchAllSurfaces.subtitleOn", defaultValue: "Cmd+P also matches terminal, browser, and markdown surfaces across workspaces.")
@@ -4815,6 +5383,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.hideAllDetails"),
                             String(localized: "settings.app.hideAllSidebarDetails", defaultValue: "Hide All Sidebar Details"),
                             subtitle: sidebarHideAllDetails
                                 ? String(localized: "settings.app.hideAllSidebarDetails.subtitleOn", defaultValue: "Show only the workspace title row. Overrides the detail toggles below.")
@@ -4828,6 +5397,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsPickerRow(
+                            configurationReview: .json("sidebar.branchLayout"),
                             String(localized: "settings.app.sidebarBranchLayout", defaultValue: "Sidebar Branch Layout"),
                             subtitle: sidebarBranchVerticalLayout
                                 ? String(localized: "settings.app.sidebarBranchLayout.subtitleVertical", defaultValue: "Vertical: each branch appears on its own line.")
@@ -4843,6 +5413,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.showNotificationMessage"),
                             String(localized: "settings.app.showNotificationMessage", defaultValue: "Show Notification Message in Sidebar"),
                             subtitle: String(localized: "settings.app.showNotificationMessage.subtitle", defaultValue: "Display the latest notification message below the workspace title.")
                         ) {
@@ -4855,6 +5426,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.showBranchDirectory"),
                             String(localized: "settings.app.showBranchDirectory", defaultValue: "Show Branch + Directory in Sidebar"),
                             subtitle: String(localized: "settings.app.showBranchDirectory.subtitle", defaultValue: "Display the built-in git branch and working-directory row.")
                         ) {
@@ -4867,6 +5439,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.showPullRequests"),
                             String(localized: "settings.app.showPullRequests", defaultValue: "Show Pull Requests in Sidebar"),
                             subtitle: String(localized: "settings.app.showPullRequests.subtitle", defaultValue: "Display review items (PR/MR/etc.) with status, number, and clickable link.")
                         ) {
@@ -4879,6 +5452,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.openPullRequestLinksInCmuxBrowser"),
                             String(localized: "settings.app.openSidebarPRLinks", defaultValue: "Open Sidebar PR Links in cmux Browser"),
                             subtitle: openSidebarPullRequestLinksInCmuxBrowser
                                 ? String(localized: "settings.app.openSidebarPRLinks.subtitleOn", defaultValue: "Clicks open inside cmux browser.")
@@ -4893,6 +5467,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.openPortLinksInCmuxBrowser"),
                             String(localized: "settings.app.openSidebarPortLinks", defaultValue: "Open Sidebar Port Links in cmux Browser"),
                             subtitle: openSidebarPortLinksInCmuxBrowser
                                 ? String(localized: "settings.app.openSidebarPortLinks.subtitleOn", defaultValue: "Port clicks open inside cmux browser.")
@@ -4907,6 +5482,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.showSSH"),
                             String(localized: "settings.app.showSSH", defaultValue: "Show SSH in Sidebar"),
                             subtitle: String(localized: "settings.app.showSSH.subtitle", defaultValue: "Display the SSH target for remote workspaces in its own row.")
                         ) {
@@ -4918,6 +5494,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.showPorts"),
                             String(localized: "settings.app.showPorts", defaultValue: "Show Listening Ports in Sidebar"),
                             subtitle: String(localized: "settings.app.showPorts.subtitle", defaultValue: "Display detected listening ports for the active workspace.")
                         ) {
@@ -4930,6 +5507,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.showLog"),
                             String(localized: "settings.app.showLog", defaultValue: "Show Latest Log in Sidebar"),
                             subtitle: String(localized: "settings.app.showLog.subtitle", defaultValue: "Display the latest imperative log/status message.")
                         ) {
@@ -4942,6 +5520,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.showProgress"),
                             String(localized: "settings.app.showProgress", defaultValue: "Show Progress in Sidebar"),
                             subtitle: String(localized: "settings.app.showProgress.subtitle", defaultValue: "Display the built-in progress bar from set_progress.")
                         ) {
@@ -4954,6 +5533,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebar.showCustomMetadata"),
                             String(localized: "settings.app.showMetadata", defaultValue: "Show Custom Metadata in Sidebar"),
                             subtitle: String(localized: "settings.app.showMetadata.subtitle", defaultValue: "Display custom metadata from report_meta/set_status and report_meta_block.")
                         ) {
@@ -4964,9 +5544,29 @@ struct SettingsView: View {
                         .disabled(sidebarHideAllDetails)
                     }
 
+                    SettingsSectionHeader(title: String(localized: "settings.section.terminal", defaultValue: "Terminal"))
+                    SettingsCard {
+                        SettingsCardRow(
+                            configurationReview: .json("terminal.showScrollBar"),
+                            String(localized: "settings.terminal.scrollBar", defaultValue: "Show Terminal Scroll Bar"),
+                            subtitle: showTerminalScrollBar
+                                ? String(localized: "settings.terminal.scrollBar.subtitleOn", defaultValue: "Shows the right-edge terminal scroll bar in shell scrollback. cmux hides it automatically for alternate-screen style TUI surfaces and you can also disable it per workspace.")
+                                : String(localized: "settings.terminal.scrollBar.subtitleOff", defaultValue: "Hides the right-edge terminal scroll bar everywhere. Changes apply immediately and persist across relaunches.")
+                        ) {
+                            Toggle("", isOn: showTerminalScrollBarBinding)
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .accessibilityIdentifier("SettingsTerminalScrollBarToggle")
+                                .accessibilityLabel(
+                                    String(localized: "settings.terminal.scrollBar", defaultValue: "Show Terminal Scroll Bar")
+                                )
+                        }
+                    }
+
                     SettingsSectionHeader(title: String(localized: "settings.section.workspaceColors", defaultValue: "Workspace Colors"))
                     SettingsCard {
                         SettingsPickerRow(
+                            configurationReview: .json("workspaceColors.indicatorStyle"),
                             String(localized: "settings.workspaceColors.indicator", defaultValue: "Workspace Color Indicator"),
                             controlWidth: pickerColumnWidth,
                             selection: sidebarIndicatorStyleSelection
@@ -4979,6 +5579,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("workspaceColors.selectionColor"),
                             String(localized: "settings.workspaceColors.selectionColor", defaultValue: "Selection Highlight"),
                             subtitle: String(localized: "settings.workspaceColors.selectionColor.subtitle", defaultValue: "Background color of the selected workspace in the sidebar.")
                         ) {
@@ -5009,6 +5610,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("workspaceColors.notificationBadgeColor"),
                             String(localized: "settings.workspaceColors.notificationBadgeColor", defaultValue: "Notification Badge"),
                             subtitle: String(localized: "settings.workspaceColors.notificationBadgeColor.subtitle", defaultValue: "Color of the unread notification badge on workspace tabs.")
                         ) {
@@ -5058,6 +5660,7 @@ struct SettingsView: View {
                                     SettingsCardDivider()
                                 }
                                 SettingsCardRow(
+                                    configurationReview: .json("workspaceColors.colors"),
                                     entry.name,
                                     subtitle: baseTabColorHex(for: entry.name).map {
                                         String(localized: "settings.workspaceColors.base", defaultValue: "Base: \($0)")
@@ -5095,6 +5698,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .action,
                             String(localized: "settings.workspaceColors.resetPalette", defaultValue: "Reset Palette"),
                             subtitle: String(
                                 localized: "settings.workspaceColors.resetPalette.subtitleV2",
@@ -5112,6 +5716,7 @@ struct SettingsView: View {
                     SettingsSectionHeader(title: String(localized: "settings.section.sidebarAppearance", defaultValue: "Sidebar Appearance"))
                     SettingsCard {
                         SettingsCardRow(
+                            configurationReview: .json("sidebarAppearance.matchTerminalBackground"),
                             String(localized: "settings.sidebarAppearance.matchTerminalBackground", defaultValue: "Match Terminal Background"),
                             subtitle: String(localized: "settings.sidebarAppearance.matchTerminalBackground.subtitle", defaultValue: "Use the same background color and transparency as the terminal.")
                         ) {
@@ -5124,6 +5729,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebarAppearance.lightModeTintColor"),
                             String(localized: "settings.sidebarAppearance.tintColorLight", defaultValue: "Light Mode Tint"),
                             subtitle: String(localized: "settings.sidebarAppearance.tintColorLight.subtitle", defaultValue: "Sidebar tint color when using light appearance.")
                         ) {
@@ -5146,6 +5752,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebarAppearance.darkModeTintColor"),
                             String(localized: "settings.sidebarAppearance.tintColorDark", defaultValue: "Dark Mode Tint"),
                             subtitle: String(localized: "settings.sidebarAppearance.tintColorDark.subtitle", defaultValue: "Sidebar tint color when using dark appearance.")
                         ) {
@@ -5168,6 +5775,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("sidebarAppearance.tintOpacity"),
                             String(localized: "settings.sidebarAppearance.tintOpacity", defaultValue: "Tint Opacity"),
                             subtitle: String(localized: "settings.sidebarAppearance.tintOpacity.subtitle", defaultValue: "How strongly the tint color shows over the sidebar material.")
                         ) {
@@ -5184,6 +5792,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .action,
                             String(localized: "settings.sidebarAppearance.reset", defaultValue: "Reset Sidebar Tint"),
                             subtitle: String(localized: "settings.sidebarAppearance.reset.subtitle", defaultValue: "Restore default sidebar appearance.")
                         ) {
@@ -5201,6 +5810,7 @@ struct SettingsView: View {
                     SettingsSectionHeader(title: String(localized: "settings.section.automation", defaultValue: "Automation"))
                     SettingsCard {
                         SettingsPickerRow(
+                            configurationReview: .json("automation.socketControlMode"),
                             String(localized: "settings.automation.socketMode", defaultValue: "Socket Control Mode"),
                             subtitle: selectedSocketControlMode.description,
                             controlWidth: pickerColumnWidth,
@@ -5218,6 +5828,7 @@ struct SettingsView: View {
                         if selectedSocketControlMode == .password {
                             SettingsCardDivider()
                             SettingsCardRow(
+                                configurationReview: .json("automation.socketPassword"),
                                 String(localized: "settings.automation.socketPassword", defaultValue: "Socket Password"),
                                 subtitle: hasSocketPasswordConfigured
                                     ? String(localized: "settings.automation.socketPassword.subtitleSet", defaultValue: "Stored in Application Support.")
@@ -5263,6 +5874,7 @@ struct SettingsView: View {
 
                     SettingsCard {
                         SettingsCardRow(
+                            configurationReview: .json("automation.claudeCodeIntegration"),
                             String(localized: "settings.automation.claudeCode", defaultValue: "Claude Code Integration"),
                             subtitle: claudeCodeHooksEnabled
                                 ? String(localized: "settings.automation.claudeCode.subtitleOn", defaultValue: "Sidebar shows Claude session status and notifications.")
@@ -5281,6 +5893,7 @@ struct SettingsView: View {
 
                     SettingsCard {
                         SettingsCardRow(
+                            configurationReview: .json("automation.claudeBinaryPath"),
                             String(localized: "settings.automation.claudeCode.customPath", defaultValue: "Claude Binary Path"),
                             subtitle: String(localized: "settings.automation.claudeCode.customPath.subtitle", defaultValue: "Custom path to the claude binary. Leave empty to use PATH.")
                         ) {
@@ -5294,7 +5907,45 @@ struct SettingsView: View {
                     }
 
                     SettingsCard {
-                        SettingsCardRow(String(localized: "settings.automation.portBase", defaultValue: "Port Base"), subtitle: String(localized: "settings.automation.portBase.subtitle", defaultValue: "Starting port for CMUX_PORT env var."), controlWidth: pickerColumnWidth) {
+                        SettingsCardRow(
+                            configurationReview: .json("automation.cursorIntegration"),
+                            String(localized: "settings.automation.cursor", defaultValue: "Cursor Integration"),
+                            subtitle: cursorHooksEnabled
+                                ? String(localized: "settings.automation.cursor.subtitleOn", defaultValue: "Sidebar shows Cursor agent status and notifications.")
+                                : String(localized: "settings.automation.cursor.subtitleOff", defaultValue: "Cursor runs without cmux integration.")
+                        ) {
+                            Toggle("", isOn: $cursorHooksEnabled)
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .accessibilityIdentifier("SettingsCursorHooksToggle")
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardNote(String(localized: "settings.automation.cursor.note", defaultValue: "Hooks must be installed with `cmux cursor install-hooks`. They no-op outside cmux terminals."))
+                    }
+
+                    SettingsCard {
+                        SettingsCardRow(
+                            configurationReview: .json("automation.geminiIntegration"),
+                            String(localized: "settings.automation.gemini", defaultValue: "Gemini CLI Integration"),
+                            subtitle: geminiHooksEnabled
+                                ? String(localized: "settings.automation.gemini.subtitleOn", defaultValue: "Sidebar shows Gemini session status and notifications.")
+                                : String(localized: "settings.automation.gemini.subtitleOff", defaultValue: "Gemini runs without cmux integration.")
+                        ) {
+                            Toggle("", isOn: $geminiHooksEnabled)
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .accessibilityIdentifier("SettingsGeminiHooksToggle")
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardNote(String(localized: "settings.automation.gemini.note", defaultValue: "Hooks must be installed with `cmux gemini install-hooks`. They no-op outside cmux terminals."))
+                    }
+
+                    SettingsCard {
+                        SettingsCardRow(configurationReview: .json("automation.portBase"), String(localized: "settings.automation.portBase", defaultValue: "Port Base"), subtitle: String(localized: "settings.automation.portBase.subtitle", defaultValue: "Starting port for CMUX_PORT env var."), controlWidth: pickerColumnWidth) {
                             TextField("", value: $cmuxPortBase, format: .number)
                                 .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
@@ -5302,7 +5953,7 @@ struct SettingsView: View {
 
                         SettingsCardDivider()
 
-                        SettingsCardRow(String(localized: "settings.automation.portRange", defaultValue: "Port Range Size"), subtitle: String(localized: "settings.automation.portRange.subtitle", defaultValue: "Number of ports per workspace."), controlWidth: pickerColumnWidth) {
+                        SettingsCardRow(configurationReview: .json("automation.portRange"), String(localized: "settings.automation.portRange", defaultValue: "Port Range Size"), subtitle: String(localized: "settings.automation.portRange.subtitle", defaultValue: "Number of ports per workspace."), controlWidth: pickerColumnWidth) {
                             TextField("", value: $cmuxPortRange, format: .number)
                                 .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
@@ -5317,6 +5968,7 @@ struct SettingsView: View {
                     SettingsCard {
                         VStack(alignment: .leading, spacing: 6) {
                             SettingsCardRow(
+                                configurationReview: .json("customCommands.trustedDirectories"),
                                 String(localized: "settings.customCommands.trustedDirectories", defaultValue: "Trusted Directories"),
                                 subtitle: String(localized: "settings.customCommands.trustedDirectories.subtitle", defaultValue: "Commands from cmux.json in these directories run without confirmation. One path per line.")
                             ) {
@@ -5350,6 +6002,7 @@ struct SettingsView: View {
                         .accessibilityIdentifier("SettingsBrowserSection")
                     SettingsCard {
                         SettingsPickerRow(
+                            configurationReview: .json("browser.defaultSearchEngine"),
                             String(localized: "settings.browser.searchEngine", defaultValue: "Default Search Engine"),
                             subtitle: String(localized: "settings.browser.searchEngine.subtitle", defaultValue: "Used by the browser address bar when input is not a URL."),
                             controlWidth: pickerColumnWidth,
@@ -5362,7 +6015,7 @@ struct SettingsView: View {
 
                         SettingsCardDivider()
 
-                        SettingsCardRow(String(localized: "settings.browser.searchSuggestions", defaultValue: "Show Search Suggestions")) {
+                        SettingsCardRow(configurationReview: .json("browser.showSearchSuggestions"), String(localized: "settings.browser.searchSuggestions", defaultValue: "Show Search Suggestions")) {
                             Toggle("", isOn: $browserSearchSuggestionsEnabled)
                                 .labelsHidden()
                                 .controlSize(.small)
@@ -5371,6 +6024,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsPickerRow(
+                            configurationReview: .json("browser.theme"),
                             String(localized: "settings.browser.theme", defaultValue: "Browser Theme"),
                             subtitle: selectedBrowserThemeMode == .system
                                 ? String(localized: "settings.browser.theme.subtitleSystem", defaultValue: "System follows app and macOS appearance.")
@@ -5386,6 +6040,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("browser.openTerminalLinksInCmuxBrowser"),
                             String(localized: "settings.browser.openTerminalLinks", defaultValue: "Open Terminal Links in cmux Browser"),
                             subtitle: String(localized: "settings.browser.openTerminalLinks.subtitle", defaultValue: "When off, links clicked in terminal output open in your default browser.")
                         ) {
@@ -5397,6 +6052,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("browser.interceptTerminalOpenCommandInCmuxBrowser"),
                             String(localized: "settings.browser.interceptOpen", defaultValue: "Intercept open http(s) in Terminal"),
                             subtitle: String(localized: "settings.browser.interceptOpen.subtitle", defaultValue: "When off, `open https://...` and `open http://...` always use your default browser.")
                         ) {
@@ -5410,6 +6066,7 @@ struct SettingsView: View {
 
                             VStack(alignment: .leading, spacing: 6) {
                                 SettingsCardRow(
+                                    configurationReview: .json("browser.hostsToOpenInEmbeddedBrowser"),
                                     String(localized: "settings.browser.hostWhitelist", defaultValue: "Hosts to Open in Embedded Browser"),
                                     subtitle: String(localized: "settings.browser.hostWhitelist.subtitle", defaultValue: "Applies to terminal link clicks and intercepted `open https://...` calls. Only these hosts open in cmux. Others open in your default browser. One host or wildcard per line (for example: example.com, *.internal.example). Leave empty to open all hosts in cmux.")
                                 ) {
@@ -5435,6 +6092,7 @@ struct SettingsView: View {
 
                             VStack(alignment: .leading, spacing: 6) {
                                 SettingsCardRow(
+                                    configurationReview: .json("browser.urlsToAlwaysOpenExternally"),
                                     String(localized: "settings.browser.externalPatterns", defaultValue: "URLs to Always Open Externally"),
                                     subtitle: String(localized: "settings.browser.externalPatterns.subtitle", defaultValue: "Applies to terminal link clicks and intercepted `open https://...` calls. One rule per line. Plain text matches any URL substring, or prefix with `re:` for regex (for example: openai.com/usage, re:^https?://[^/]*\\.example\\.com/(billing|usage)).")
                                 ) {
@@ -5593,6 +6251,7 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("browser.reactGrabVersion"),
                             String(localized: "settings.browser.reactGrabVersion", defaultValue: "React Grab Version"),
                             subtitle: String(localized: "settings.browser.reactGrabVersion.subtitle", defaultValue: "Pinned npm version of react-grab injected by the toolbar button (Cmd+Shift+G). Only versions with a known integrity hash are accepted.")
                         ) {
@@ -5605,7 +6264,7 @@ struct SettingsView: View {
 
                         SettingsCardDivider()
 
-                        SettingsCardRow(String(localized: "settings.browser.history", defaultValue: "Browsing History"), subtitle: browserHistorySubtitle) {
+                        SettingsCardRow(configurationReview: .action, String(localized: "settings.browser.history", defaultValue: "Browsing History"), subtitle: browserHistorySubtitle) {
                             Button(String(localized: "settings.browser.history.clearButton", defaultValue: "Clear History…")) {
                                 showClearBrowserHistoryConfirmation = true
                             }
@@ -5615,11 +6274,14 @@ struct SettingsView: View {
                         }
                     }
 
+                    GlobalHotkeySection()
+
                     SettingsSectionHeader(title: String(localized: "settings.section.keyboardShortcuts", defaultValue: "Keyboard Shortcuts"))
                         .id(SettingsNavigationTarget.keyboardShortcuts)
                         .accessibilityIdentifier("SettingsKeyboardShortcutsSection")
                     SettingsCard {
                         SettingsCardRow(
+                            configurationReview: .action,
                             String(localized: "settings.shortcuts.chords", defaultValue: "Shortcut Chords"),
                             subtitle: String(localized: "settings.shortcuts.chords.subtitle", defaultValue: "Add tmux-style multi-step shortcuts in settings.json, for example [\"ctrl+b\", \"c\"].")
                         ) {
@@ -5640,19 +6302,31 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardRow(
+                            configurationReview: .json("shortcuts.showModifierHoldHints"),
                             String(localized: "settings.shortcuts.showHints", defaultValue: "Show Cmd/Ctrl-Hold Shortcut Hints"),
-                            subtitle: showShortcutHintsOnCommandHold
+                            subtitle: (showShortcutHintsOnCommandHold || showShortcutHintsOnControlHold)
                                 ? String(localized: "settings.shortcuts.showHints.subtitleOn", defaultValue: "Holding Cmd (sidebar/titlebar) or Ctrl/Cmd (pane tabs) shows shortcut hint pills.")
                                 : String(localized: "settings.shortcuts.showHints.subtitleOff", defaultValue: "Holding Cmd or Ctrl keeps shortcut hint pills hidden.")
                         ) {
-                            Toggle("", isOn: $showShortcutHintsOnCommandHold)
+                            Toggle(
+                                "",
+                                isOn: Binding(
+                                    get: { showShortcutHintsOnCommandHold || showShortcutHintsOnControlHold },
+                                    set: { newValue in
+                                        showShortcutHintsOnCommandHold = newValue
+                                        showShortcutHintsOnControlHold = newValue
+                                    }
+                                )
+                            )
                                 .labelsHidden()
                                 .controlSize(.small)
                         }
 
                         SettingsCardDivider()
 
-                        let actions = KeyboardShortcutSettings.Action.allCases
+                        let actions = KeyboardShortcutSettings.Action.allCases.filter {
+                            $0 != SystemWideHotkeySettings.action
+                        }
                         ForEach(Array(actions.enumerated()), id: \.element.id) { index, action in
                             ShortcutSettingRow(action: action)
                                 .padding(.horizontal, 14)
@@ -5857,6 +6531,11 @@ struct SettingsView: View {
         }
     }
 
+    private static func validateBypassedSettingsConfigurationReviews() {
+        SettingsConfigurationReview.json("browser.insecureHttpHostsAllowedInEmbeddedBrowser").validate()
+        SettingsConfigurationReview.json("browser.showImportHintOnBlankTabs").validate()
+    }
+
     private func relaunchApp() {
         let bundlePath = Bundle.main.bundlePath
         let task = Process()
@@ -5884,8 +6563,11 @@ struct SettingsView: View {
         socketControlMode = SocketControlSettings.defaultMode.rawValue
         claudeCodeHooksEnabled = ClaudeCodeIntegrationSettings.defaultHooksEnabled
         customClaudePath = ""
+        cursorHooksEnabled = CursorIntegrationSettings.defaultHooksEnabled
+        geminiHooksEnabled = GeminiIntegrationSettings.defaultHooksEnabled
         sendAnonymousTelemetry = TelemetrySettings.defaultSendAnonymousTelemetry
         preferredEditorCommand = ""
+        openMarkdownInCmuxViewer = CmdClickMarkdownRouteSettings.defaultValue
         browserSearchEngine = BrowserSearchSettings.defaultSearchEngine.rawValue
         browserSearchSuggestionsEnabled = BrowserSearchSettings.defaultSearchSuggestionsEnabled
         browserThemeMode = BrowserThemeSettings.defaultMode.rawValue
@@ -5923,6 +6605,11 @@ struct SettingsView: View {
         defaults.removeObject(forKey: WorkspaceButtonFadeSettings.legacyPaneTabBarControlsVisibilityModeKey)
         closeWorkspaceOnLastSurfaceShortcut = LastSurfaceCloseShortcutSettings.defaultValue
         paneFirstClickFocusEnabled = PaneFirstClickFocusSettings.defaultEnabled
+        let previousShowTerminalScrollBar = showTerminalScrollBar
+        showTerminalScrollBar = TerminalScrollBarSettings.defaultShowScrollBar
+        if previousShowTerminalScrollBar != showTerminalScrollBar {
+            TerminalScrollBarSettings.notifyDidChange()
+        }
         workspaceAutoReorder = WorkspaceAutoReorderSettings.defaultValue
         sidebarHideAllDetails = SidebarWorkspaceDetailSettings.defaultHideAllDetails
         sidebarShowNotificationMessage = SidebarWorkspaceDetailSettings.defaultShowNotificationMessage
@@ -5935,6 +6622,7 @@ struct SettingsView: View {
         openSidebarPullRequestLinksInCmuxBrowser = BrowserLinkOpenSettings.defaultOpenSidebarPullRequestLinksInCmuxBrowser
         openSidebarPortLinksInCmuxBrowser = BrowserLinkOpenSettings.defaultOpenSidebarPortLinksInCmuxBrowser
         showShortcutHintsOnCommandHold = ShortcutHintDebugSettings.defaultShowHintsOnCommandHold
+        showShortcutHintsOnControlHold = ShortcutHintDebugSettings.defaultShowHintsOnControlHold
         sidebarShowSSH = true
         sidebarShowPorts = true
         sidebarShowLog = true
@@ -5951,6 +6639,7 @@ struct SettingsView: View {
         socketPasswordStatusMessage = nil
         socketPasswordStatusIsError = false
         refreshDetectedImportBrowsers()
+        SystemWideHotkeySettings.reset()
         KeyboardShortcutSettings.resetAll()
         WorkspaceTabColorSettings.reset()
         reloadWorkspaceTabColorSettings()
@@ -6044,6 +6733,84 @@ private struct SettingsSectionHeader: View {
     }
 }
 
+private struct AuthSettingsRow: View {
+    @ObservedObject var authManager: AuthManager
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(titleText)
+                    .font(.system(size: 13, weight: .medium))
+                if let subtitle = subtitleText {
+                    Text(subtitle)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+            }
+            Spacer(minLength: 12)
+            if authManager.isLoading || authManager.isRestoringSession {
+                ProgressView().controlSize(.small)
+            }
+            Button(action: buttonAction) {
+                Text(buttonTitle)
+            }
+            .controlSize(.small)
+            .disabled(authManager.isLoading || authManager.isRestoringSession)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    private var titleText: String {
+        if authManager.isAuthenticated {
+            if let email = authManager.currentUser?.primaryEmail, !email.isEmpty {
+                return email
+            }
+            return String(
+                localized: "settings.account.signedIn.title",
+                defaultValue: "Signed in"
+            )
+        }
+        return String(
+            localized: "settings.account.signedOut.title",
+            defaultValue: "Not signed in"
+        )
+    }
+
+    private var subtitleText: String? {
+        if authManager.isAuthenticated {
+            return authManager.currentUser?.displayName
+        }
+        return String(
+            localized: "settings.account.signedOut.subtitle",
+            defaultValue: "Sign in with your cmux account to enable sync across devices."
+        )
+    }
+
+    private var buttonTitle: String {
+        if authManager.isAuthenticated {
+            return String(
+                localized: "settings.account.signOut",
+                defaultValue: "Sign Out"
+            )
+        }
+        return String(
+            localized: "settings.account.signIn",
+            defaultValue: "Sign In…"
+        )
+    }
+
+    private func buttonAction() {
+        if authManager.isAuthenticated {
+            Task { @MainActor in
+                await authManager.signOut()
+            }
+        } else {
+            authManager.beginSignIn()
+        }
+    }
+}
+
 private struct SettingsCard<Content: View>: View {
     @ViewBuilder let content: Content
 
@@ -6096,17 +6863,21 @@ private struct SettingsHeaderActionButton: View {
 }
 
 private struct SettingsCardRow<Trailing: View>: View {
+    let configurationReview: SettingsConfigurationReview
     let title: String
     let subtitle: String?
     let controlWidth: CGFloat?
     @ViewBuilder let trailing: Trailing
 
     init(
+        configurationReview: SettingsConfigurationReview,
         _ title: String,
         subtitle: String? = nil,
         controlWidth: CGFloat? = nil,
         @ViewBuilder trailing: () -> Trailing
     ) {
+        configurationReview.validate()
+        self.configurationReview = configurationReview
         self.title = title
         self.subtitle = subtitle
         self.controlWidth = controlWidth
@@ -6144,6 +6915,7 @@ private struct SettingsCardRow<Trailing: View>: View {
 }
 
 private struct SettingsPickerRow<SelectionValue: Hashable, PickerContent: View, ExtraTrailing: View>: View {
+    let configurationReview: SettingsConfigurationReview
     let title: String
     let subtitle: String?
     let controlWidth: CGFloat
@@ -6153,6 +6925,7 @@ private struct SettingsPickerRow<SelectionValue: Hashable, PickerContent: View, 
     let accessibilityId: String?
 
     init(
+        configurationReview: SettingsConfigurationReview,
         _ title: String,
         subtitle: String? = nil,
         controlWidth: CGFloat,
@@ -6161,6 +6934,8 @@ private struct SettingsPickerRow<SelectionValue: Hashable, PickerContent: View, 
         @ViewBuilder content: () -> PickerContent,
         @ViewBuilder extraTrailing: () -> ExtraTrailing
     ) {
+        configurationReview.validate()
+        self.configurationReview = configurationReview
         self.title = title
         self.subtitle = subtitle
         self.controlWidth = controlWidth
@@ -6171,7 +6946,7 @@ private struct SettingsPickerRow<SelectionValue: Hashable, PickerContent: View, 
     }
 
     var body: some View {
-        SettingsCardRow(title, subtitle: subtitle, controlWidth: controlWidth) {
+        SettingsCardRow(configurationReview: configurationReview, title, subtitle: subtitle, controlWidth: controlWidth) {
             HStack(spacing: 6) {
                 Picker("", selection: $selection) {
                     pickerContent
@@ -6187,6 +6962,7 @@ private struct SettingsPickerRow<SelectionValue: Hashable, PickerContent: View, 
 
 extension SettingsPickerRow where ExtraTrailing == EmptyView {
     init(
+        configurationReview: SettingsConfigurationReview,
         _ title: String,
         subtitle: String? = nil,
         controlWidth: CGFloat,
@@ -6194,9 +6970,31 @@ extension SettingsPickerRow where ExtraTrailing == EmptyView {
         accessibilityId: String? = nil,
         @ViewBuilder content: () -> PickerContent
     ) {
-        self.init(title, subtitle: subtitle, controlWidth: controlWidth, selection: selection, accessibilityId: accessibilityId, content: content) {
+        self.init(configurationReview: configurationReview, title, subtitle: subtitle, controlWidth: controlWidth, selection: selection, accessibilityId: accessibilityId, content: content) {
             EmptyView()
         }
+    }
+}
+
+private enum SettingsConfigurationReview: Equatable {
+    case settingsFile([String])
+    case settingsOnly
+    case action
+    case debugOnly
+
+    static func json(_ paths: String...) -> Self {
+        .settingsFile(paths)
+    }
+
+    func validate(file: StaticString = #fileID, line: UInt = #line) {
+        guard case .settingsFile(let paths) = self else { return }
+        let unknownPaths = paths.filter { !CmuxSettingsFileStore.supportedSettingsJSONPaths.contains($0) }
+        precondition(
+            unknownPaths.isEmpty,
+            "Unknown settings.json path(s): \(unknownPaths.joined(separator: ", "))",
+            file: file,
+            line: line
+        )
     }
 }
 
@@ -6340,11 +7138,23 @@ private struct ThemeWindowThumbnail: View {
 }
 
 private struct ThemePickerRow: View {
+    let configurationReview: SettingsConfigurationReview
     let selectedMode: String
     let onSelect: (AppearanceMode) -> Void
 
     private let thumbWidth: CGFloat = 76
     private let thumbHeight: CGFloat = 50
+
+    init(
+        configurationReview: SettingsConfigurationReview,
+        selectedMode: String,
+        onSelect: @escaping (AppearanceMode) -> Void
+    ) {
+        configurationReview.validate()
+        self.configurationReview = configurationReview
+        self.selectedMode = selectedMode
+        self.onSelect = onSelect
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -6424,11 +7234,23 @@ private struct ThemePickerRow: View {
 }
 
 private struct AppIconPickerRow: View {
+    let configurationReview: SettingsConfigurationReview
     let selectedMode: String
     let onSelect: (AppIconMode) -> Void
 
     private let iconSize: CGFloat = 48
     private let autoIconSize: CGFloat = 36
+
+    init(
+        configurationReview: SettingsConfigurationReview,
+        selectedMode: String,
+        onSelect: @escaping (AppIconMode) -> Void
+    ) {
+        configurationReview.validate()
+        self.configurationReview = configurationReview
+        self.selectedMode = selectedMode
+        self.onSelect = onSelect
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -6515,12 +7337,11 @@ private struct ShortcutSettingRow: View {
     }
 
     var body: some View {
-        KeyboardShortcutRecorder(
-            label: action.label,
-            subtitle: KeyboardShortcutSettings.settingsFileManagedSubtitle(for: action),
+        ShortcutRecorderSettingsControl(
+            action: action,
             shortcut: $shortcut,
+            subtitle: KeyboardShortcutSettings.settingsFileManagedSubtitle(for: action),
             displayString: { action.displayedShortcutString(for: $0) },
-            transformRecordedShortcut: { action.normalizedRecordedShortcut($0) },
             isDisabled: KeyboardShortcutSettings.isManagedBySettingsFile(action)
         )
             .onChange(of: shortcut) { newValue in
@@ -6532,6 +7353,149 @@ private struct ShortcutSettingRow: View {
                     shortcut = latest
                 }
             }
+    }
+}
+
+private struct ShortcutRecorderSettingsControl: View {
+    let action: KeyboardShortcutSettings.Action
+    @Binding var shortcut: StoredShortcut
+    var subtitle: String? = nil
+    var displayString: (StoredShortcut) -> String = { $0.displayString }
+    var isDisabled: Bool = false
+
+    @State private var rejectedAttempt: ShortcutRecorderRejectedAttempt?
+
+    var body: some View {
+        KeyboardShortcutRecorder(
+            label: action.label,
+            subtitle: subtitle,
+            shortcut: $shortcut,
+            displayString: displayString,
+            transformRecordedShortcut: { action.normalizedRecordedShortcutResult($0) },
+            validationMessage: validationPresentation?.message,
+            validationButtonTitle: validationPresentation?.swapButtonTitle,
+            onValidationButtonPressed: validationPresentation?.canSwap == true
+                ? { swapConflictingShortcut() }
+                : nil,
+            undoButtonTitle: validationPresentation?.undoButtonTitle,
+            onUndoButtonPressed: rejectedAttempt != nil ? { rejectedAttempt = nil } : nil,
+            hasPendingRejection: rejectedAttempt != nil,
+            isDisabled: isDisabled,
+            onRecorderFeedbackChanged: { rejectedAttempt = $0 }
+        )
+        .onChange(of: shortcut) { _ in
+            rejectedAttempt = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: KeyboardShortcutRecorderActivity.didChangeNotification)) { _ in
+            if KeyboardShortcutRecorderActivity.isAnyRecorderActive {
+                rejectedAttempt = nil
+            }
+        }
+    }
+
+    private var validationPresentation: ShortcutRecorderValidationPresentation? {
+        ShortcutRecorderValidationPresentation(
+            attempt: rejectedAttempt,
+            action: action,
+            currentShortcut: shortcut
+        )
+    }
+
+    private func swapConflictingShortcut() {
+        guard case let .conflictsWithAction(conflictingAction)? = rejectedAttempt?.reason,
+              let proposedShortcut = rejectedAttempt?.proposedShortcut else {
+            return
+        }
+
+        KeyboardShortcutRecorderActivity.stopAllRecording()
+
+        let previousShortcut = shortcut
+        KeyboardShortcutSettings.swapShortcutConflict(
+            proposedShortcut: proposedShortcut,
+            currentAction: action,
+            conflictingAction: conflictingAction,
+            previousShortcut: previousShortcut
+        )
+        shortcut = proposedShortcut
+        rejectedAttempt = nil
+    }
+}
+
+private struct GlobalHotkeySection: View {
+    @AppStorage(SystemWideHotkeySettings.enabledKey) private var isEnabled = SystemWideHotkeySettings.defaultEnabled
+    @State private var shortcut = KeyboardShortcutSettings.shortcut(for: SystemWideHotkeySettings.action)
+
+    private var enabledBinding: Binding<Bool> {
+        Binding(
+            get: { isEnabled },
+            set: { newValue in
+                isEnabled = newValue
+            }
+        )
+    }
+
+    private var enableSubtitle: String {
+        if isEnabled {
+            return String(
+                localized: "settings.globalHotkey.enable.subtitleOn",
+                defaultValue: "Press the shortcut from any app to show or hide all cmux windows."
+            )
+        }
+        return String(
+            localized: "settings.globalHotkey.enable.subtitleOff",
+            defaultValue: "Turn this on to show or hide all cmux windows from any app."
+        )
+    }
+
+    var body: some View {
+        SettingsSectionHeader(title: String(localized: "settings.section.globalHotkey", defaultValue: "Global Hotkey"))
+            .accessibilityIdentifier("SettingsGlobalHotkeySection")
+
+        SettingsCard {
+            SettingsCardRow(
+                configurationReview: .settingsOnly,
+                String(localized: "settings.globalHotkey.enable", defaultValue: "Enable System-Wide Hotkey"),
+                subtitle: enableSubtitle
+            ) {
+                Toggle("", isOn: enabledBinding)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .accessibilityIdentifier("SettingsGlobalHotkeyToggle")
+            }
+
+            SettingsCardDivider()
+
+            ShortcutRecorderSettingsControl(
+                action: SystemWideHotkeySettings.action,
+                shortcut: $shortcut,
+                subtitle: KeyboardShortcutSettings.settingsFileManagedSubtitle(for: SystemWideHotkeySettings.action),
+                isDisabled: KeyboardShortcutSettings.isManagedBySettingsFile(SystemWideHotkeySettings.action)
+            )
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .accessibilityIdentifier("SettingsGlobalHotkeyRecorder")
+        }
+        .onChange(of: shortcut) { newValue in
+            KeyboardShortcutSettings.setShortcut(newValue, for: SystemWideHotkeySettings.action)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: KeyboardShortcutSettings.didChangeNotification)) { _ in
+            syncFromDefaults()
+        }
+
+        SettingsCardNote(
+            String(
+                localized: "settings.globalHotkey.note",
+                defaultValue: "Use Command, Option, or Control with another key. No extra macOS permission is required."
+            )
+        )
+            .accessibilityIdentifier("SettingsGlobalHotkeyNote")
+    }
+
+    private func syncFromDefaults() {
+        let latestShortcut = KeyboardShortcutSettings.shortcut(for: SystemWideHotkeySettings.action)
+        if latestShortcut != shortcut {
+            shortcut = latestShortcut
+        }
     }
 }
 

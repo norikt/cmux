@@ -25,6 +25,12 @@ export const shortcutCategories: ShortcutCategory[] = [
     shortcuts: [
       { id: "openSettings", combos: [["⌘", ","]], description: { en: "Settings", ja: "設定" } },
       { id: "reloadConfiguration", combos: [["⌘", "⇧", ","]], description: { en: "Reload configuration", ja: "構成を再読み込み" } },
+      {
+        id: "showHideAllWindows",
+        combos: [["⌃", "⌥", "⌘", "."]],
+        description: { en: "Show/hide all cmux windows", ja: "すべてのcmuxウインドウを表示/非表示" },
+        note: { en: "system-wide hotkey", ja: "システム全体のホットキー" },
+      },
       { id: "commandPalette", combos: [["⌘", "⇧", "P"]], description: { en: "Command palette", ja: "コマンドパレット" } },
       { id: "newWindow", combos: [["⌘", "⇧", "N"]], description: { en: "New window", ja: "新規ウインドウ" } },
       { id: "closeWindow", combos: [["⌃", "⌘", "W"]], description: { en: "Close window", ja: "ウインドウを閉じる" } },
@@ -60,6 +66,12 @@ export const shortcutCategories: ShortcutCategory[] = [
     blurbKey: "surfacesBlurb",
     shortcuts: [
       { id: "newSurface", combos: [["⌘", "T"]], description: { en: "New surface", ja: "新規サーフェス" } },
+      {
+        id: "openLazygitFloating",
+        combos: [["Not Set"]],
+        description: { en: "Lazygit floating window", ja: "Lazygit浮動ウィンドウ" },
+        note: { en: "assign in Settings > Keyboard Shortcuts", ja: "設定 > Keyboard Shortcuts で割り当て" },
+      },
       { id: "nextSurface", combos: [["⌘", "⇧", "]"]], description: { en: "Next surface", ja: "次のサーフェス" } },
       { id: "prevSurface", combos: [["⌘", "⇧", "["]], description: { en: "Previous surface", ja: "前のサーフェス" } },
       { id: "selectSurfaceByNumber", combos: [["⌃", "1…9"]], description: { en: "Select surface 1…9", ja: "サーフェス1…9を選択" } },
@@ -106,9 +118,12 @@ export const shortcutCategories: ShortcutCategory[] = [
       { id: "showBrowserJavaScriptConsole", combos: [["⌥", "⌘", "C"]], description: { en: "Show browser JavaScript console", ja: "ブラウザJavaScriptコンソールを表示" } },
       {
         id: "toggleReactGrab",
-        combos: [["⌥", "⌘", "G"]],
+        combos: [["⌘", "⇧", "G"]],
         description: { en: "Toggle React Grab", ja: "React Grabを切り替え" },
-        note: { en: "focused browser", ja: "フォーカス中のブラウザ" },
+        note: {
+          en: "focused browser, or the only browser pane when a terminal is focused",
+          ja: "フォーカス中のブラウザ、またはターミナルにフォーカスがあるときは唯一のブラウザペイン",
+        },
       },
     ],
   },
@@ -118,7 +133,7 @@ export const shortcutCategories: ShortcutCategory[] = [
     shortcuts: [
       { id: "find", combos: [["⌘", "F"]], description: { en: "Find", ja: "検索" } },
       { id: "findNext", combos: [["⌘", "G"]], description: { en: "Find next", ja: "次を検索" } },
-      { id: "findPrevious", combos: [["⌘", "⇧", "G"]], description: { en: "Find previous", ja: "前を検索" } },
+      { id: "findPrevious", combos: [["⌥", "⌘", "G"]], description: { en: "Find previous", ja: "前を検索" } },
       { id: "hideFind", combos: [["⌘", "⇧", "F"]], description: { en: "Hide find bar", ja: "検索バーを隠す" } },
       { id: "useSelectionForFind", combos: [["⌘", "E"]], description: { en: "Use selection for find", ja: "選択範囲で検索" } },
     ],

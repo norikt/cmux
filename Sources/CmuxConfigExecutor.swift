@@ -25,6 +25,20 @@ struct CmuxConfigExecutor {
                     guard showConfirmDialog(command: shellCommand, configPath: sourcePath) else { return }
                 }
             }
+            if command.window?.mode == .floating {
+                // Inherit cwd from the focused terminal so lazygit-style tools open
+                // on the repository the user is currently working in.
+                let inheritedCwd = tabManager.selectedWorkspace?.focusedTerminalPanel?
+                    .requestedWorkingDirectory?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let floatingBaseCwd = (inheritedCwd?.isEmpty == false) ? inheritedCwd! : baseCwd
+                FloatingTerminalWindowController.open(
+                    command: command,
+                    shellCommand: shellCommand,
+                    baseCwd: floatingBaseCwd
+                )
+                return
+            }
             guard let terminal = tabManager.selectedWorkspace?.focusedTerminalPanel else { return }
             terminal.sendInput(shellCommand + "\n")
         }

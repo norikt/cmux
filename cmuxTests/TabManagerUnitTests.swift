@@ -404,6 +404,42 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
         XCTAssertFalse(TabManager.shouldSkipWorkspacePullRequestLookup(branch: "release/master-fix"))
     }
 
+    func testWorkspacePullRequestRefreshAllowsRepoCacheForTimerAndPeriodicReasons() {
+        XCTAssertTrue(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "periodicPoll"))
+        XCTAssertTrue(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "periodicPoll.followUp"))
+        XCTAssertTrue(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "selectedPeriodicPoll"))
+        XCTAssertTrue(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "selectedPeriodicPoll.followUp"))
+        XCTAssertTrue(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "timer"))
+        XCTAssertTrue(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "timer.followUp"))
+
+        XCTAssertFalse(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "branchChange"))
+        XCTAssertFalse(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "branchChange.followUp"))
+        XCTAssertFalse(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "shellPrompt"))
+        XCTAssertFalse(TabManager.workspacePullRequestRefreshAllowsRepoCache(reason: "commandHint:merge"))
+    }
+
+    func testWorkspacePullRequestShouldRefreshHonorsForcedRefreshForTerminalStates() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let recentTerminalRefresh = now.addingTimeInterval(-60)
+
+        XCTAssertTrue(
+            TabManager.shouldRefreshWorkspacePullRequest(
+                now: now,
+                nextPollAt: .distantPast,
+                lastTerminalStateRefreshAt: recentTerminalRefresh,
+                currentPullRequestStatus: .merged
+            )
+        )
+        XCTAssertFalse(
+            TabManager.shouldRefreshWorkspacePullRequest(
+                now: now,
+                nextPollAt: now.addingTimeInterval(60),
+                lastTerminalStateRefreshAt: recentTerminalRefresh,
+                currentPullRequestStatus: .closed
+            )
+        )
+    }
+
     func testTrackedWorkspaceGitMetadataPollCandidatesIncludeMainAndMasterPanels() throws {
         let manager = TabManager()
         guard let workspace = manager.selectedWorkspace,
@@ -710,8 +746,8 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
             return
         }
 
-        workspace.updatePanelDirectory(panelId: panelId, directory: repoURL.path)
-        workspace.updatePanelGitBranch(panelId: panelId, branch: "feature/sidebar-pr", isDirty: false)
+        manager.updateSurfaceDirectory(tabId: workspace.id, surfaceId: panelId, directory: repoURL.path)
+        manager.updateSurfaceGitBranch(tabId: workspace.id, surfaceId: panelId, branch: "feature/sidebar-pr", isDirty: false)
         workspace.updatePanelPullRequest(
             panelId: panelId,
             number: 1052,
@@ -847,6 +883,72 @@ final class TabManagerCloseWorkspacesWithConfirmationTests: XCTestCase {
         XCTAssertEqual(prompts.first?.message, expectedMessage)
         XCTAssertEqual(prompts.first?.acceptCmdD, false)
         XCTAssertEqual(manager.tabs.map(\.title), ["Alpha", "Beta", "Gamma"])
+    }
+}
+
+@MainActor
+final class TabManagerCloseCurrentTabSpamTests: XCTestCase {
+    func testCloseCurrentTabSpamWithConfirmationEnabledPromptsOnceAndClosesOneWorkspace() {
+        let manager = TabManager()
+        while manager.tabs.count < 6 {
+            _ = manager.addWorkspace()
+        }
+
+        for workspace in manager.tabs {
+            guard let panelId = workspace.focusedPanelId,
+                  let terminalPanel = workspace.terminalPanel(for: panelId) else {
+                XCTFail("Expected each workspace to have a focused terminal panel")
+                return
+            }
+            terminalPanel.surface.setNeedsConfirmCloseOverrideForTesting(true)
+        }
+
+        var prompts: [(title: String, message: String, acceptCmdD: Bool)] = []
+        manager.confirmCloseHandler = { title, message, acceptCmdD in
+            prompts.append((title, message, acceptCmdD))
+            return true
+        }
+
+        for _ in 0..<5 {
+            manager.closeCurrentTabWithConfirmation()
+        }
+
+        XCTAssertEqual(prompts.count, 1, "Expected close-tab spam to surface only one confirmation prompt")
+        XCTAssertEqual(
+            prompts.first?.title,
+            String(localized: "dialog.closeWorkspace.title", defaultValue: "Close workspace?")
+        )
+        XCTAssertEqual(prompts.first?.acceptCmdD, false)
+        XCTAssertEqual(manager.tabs.count, 5, "Expected only one workspace to close after the first accepted confirmation")
+    }
+
+    func testCloseCurrentTabSpamWithConfirmationDisabledClosesEveryRequestedWorkspace() {
+        let manager = TabManager()
+        while manager.tabs.count < 6 {
+            _ = manager.addWorkspace()
+        }
+
+        for workspace in manager.tabs {
+            guard let panelId = workspace.focusedPanelId,
+                  let terminalPanel = workspace.terminalPanel(for: panelId) else {
+                XCTFail("Expected each workspace to have a focused terminal panel")
+                return
+            }
+            terminalPanel.surface.setNeedsConfirmCloseOverrideForTesting(false)
+        }
+
+        var promptCount = 0
+        manager.confirmCloseHandler = { _, _, _ in
+            promptCount += 1
+            return true
+        }
+
+        for _ in 0..<5 {
+            manager.closeCurrentTabWithConfirmation()
+        }
+
+        XCTAssertEqual(promptCount, 0, "Expected warning-disabled close-tab spam to bypass confirmation entirely")
+        XCTAssertEqual(manager.tabs.count, 1, "Expected warning-disabled close-tab spam to close all requested workspaces")
     }
 }
 
